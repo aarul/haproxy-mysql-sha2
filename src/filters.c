@@ -1,0 +1,4203 @@
+/*
+ * Stream filters related variables and functions.
+ *
+ * Copyright (C) 2015 Qualys Inc., Christopher Faulet <cfaulet@qualys.com>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version
+ * 2 of the License, or (at your option) any later version.
+ *
+ */
+
+#include <haproxy/api.h>
+#include <haproxy/buf-t.h>
+#include <haproxy/cfgparse.h>
+#include <haproxy/cli.h>
+#include <haproxy/cli-t.h>
+#include <haproxy/compression.h>
+#include <haproxy/errors.h>
+#include <haproxy/filters.h>
+#include <haproxy/flt_decomp.h>
+#include <haproxy/flt_http_comp.h>
+#include <haproxy/global.h>
+#include <haproxy/http_ana.h>
+#include <haproxy/http_htx.h>
+#include <haproxy/htx.h>
+#include <haproxy/log.h>
+#include <haproxy/namespace.h>
+#include <haproxy/proxy.h>
+#include <haproxy/stream.h>
+#include <haproxy/thread.h>
+#include <haproxy/tools.h>
+#include <haproxy/twork.h>
+#include <haproxy/trace.h>
+
+
+#define TRACE_SOURCE &trace_strm
+
+/* All internal filter classes (should be extended if new filters are added) */
+struct filter_class flt_trace_cls;
+struct filter_class flt_cache_store_cls;
+struct filter_class flt_http_comp_req_cls;
+struct filter_class flt_http_comp_res_cls;
+struct filter_class flt_decomp_req_cls;
+struct filter_class flt_decomp_res_cls;
+#if defined(USE_SPOE)
+struct filter_class flt_spoe_cls;
+#endif
+#if defined(USE_LUA)
+struct filter_class flt_lua_cls;
+#endif
+struct filter_class flt_bwlim_in_cls;
+struct filter_class flt_bwlim_out_cls;
+#if defined(USE_FCGI)
+struct filter_class flt_fcgi_cls;
+#endif
+
+/* Global registry of all filter classes, in registration order. Used for the
+ * class lookup and by "haproxy -vv".
+ */
+static struct list filter_classes = LIST_HEAD_INIT(filter_classes);
+
+/* Ordered lists of the filter classes, one per evaluation order. The global
+ * order follows the registration order until a class is explicitly placed, the
+ * request and the response orders only contain the placed classes.
+ */
+static struct list global_filter_classes = LIST_HEAD_INIT(global_filter_classes);
+static struct list req_filter_classes = LIST_HEAD_INIT(req_filter_classes);
+static struct list res_filter_classes = LIST_HEAD_INIT(res_filter_classes);
+
+/* Used to be sure internal filters classes are initialized before any other ones */
+static int filter_classes_initialized = 0;
+
+/* If set, downgrade the filter API to the legacy mode by default (with implicit declarations only) */
+static int filter_api_downgraded = 0;
+
+/* Pool used to allocate filters */
+DECLARE_STATIC_TYPED_POOL(pool_head_filter, "filter", struct filter);
+
+static int handle_analyzer_result(struct stream *s, struct channel *chn, unsigned int an_bit, int ret);
+
+/* Helpers selecting one of the independent global/request/response orders. */
+static const char *flt_side_name(unsigned int side)
+{
+	if (side == FLT_SIDE_REQ)
+		return "request";
+	if (side == FLT_SIDE_RES)
+		return "response";
+	return "global";
+}
+
+/* Return 0 for an invalid order name. */
+static unsigned int flt_parse_side(const char *name)
+{
+	if (strcmp(name, "global") == 0)
+		return FLT_SIDE_GLOBAL;
+	if (strcmp(name, "request") == 0)
+		return FLT_SIDE_REQ;
+	if (strcmp(name, "response") == 0)
+		return FLT_SIDE_RES;
+	return 0;
+}
+
+static struct list *flt_class_refs(struct proxy *px, unsigned int side)
+{
+	if (side == FLT_SIDE_REQ)
+		return &px->conf.filter_req_refs;
+	if (side == FLT_SIDE_RES)
+		return &px->conf.filter_res_refs;
+	return &px->conf.filter_refs;
+}
+
+static struct list *flt_instances(struct proxy *px, unsigned int side)
+{
+	if (side == FLT_SIDE_REQ)
+		return &px->filter_req_instances;
+	if (side == FLT_SIDE_RES)
+		return &px->filter_res_instances;
+	return &px->filter_instances;
+}
+
+static struct filter_inst_side *flt_inst_side(struct filter_instance *inst, unsigned int side)
+{
+	if (side == FLT_SIDE_REQ)
+		return &inst->req;
+	if (side == FLT_SIDE_RES)
+		return &inst->res;
+	return &inst->global;
+}
+
+static struct filter_instance *flt_inst_from_list(struct list *entry, unsigned int side)
+{
+	if (side == FLT_SIDE_REQ)
+		return LIST_ELEM(entry, struct filter_instance *, req.list);
+	if (side == FLT_SIDE_RES)
+		return LIST_ELEM(entry, struct filter_instance *, res.list);
+	return LIST_ELEM(entry, struct filter_instance *, global.list);
+}
+
+/* Returns the anchor of <cls> in the evaluation order of <side>, one of
+ * FLT_SIDE_GLOBAL, FLT_SIDE_REQ or FLT_SIDE_RES.
+ */
+static struct filter_class_side *flt_class_side(struct filter_class *cls, unsigned int side)
+{
+	if (side == FLT_SIDE_REQ)
+		return &cls->req;
+	if (side == FLT_SIDE_RES)
+		return &cls->res;
+	return &cls->global;
+}
+
+/* Returns the head of the class order of <side>. The global order is its own
+ * list, distinct from the registry of the registered classes.
+ */
+static struct list *flt_class_order(unsigned int side)
+{
+	if (side == FLT_SIDE_REQ)
+		return &req_filter_classes;
+	if (side == FLT_SIDE_RES)
+		return &res_filter_classes;
+	return &global_filter_classes;
+}
+
+/* Returns the class linked in <entry>, in the order of <side>. */
+static struct filter_class *flt_class_from_list(struct list *entry, unsigned int side)
+{
+	if (side == FLT_SIDE_REQ)
+		return LIST_ELEM(entry, struct filter_class *, req.list);
+	if (side == FLT_SIDE_RES)
+		return LIST_ELEM(entry, struct filter_class *, res.list);
+	return LIST_ELEM(entry, struct filter_class *, global.list);
+}
+
+/* Initialize all links before any fallible operation, so error cleanup can
+ * unlink a partially built instance from any of its three orders.
+ */
+static struct filter_instance *flt_alloc_instance(void)
+{
+	struct filter_instance *inst;
+	struct filter_inst_side *ds;
+	unsigned int side;
+
+	inst = calloc(1, sizeof(*inst));
+	if (!inst)
+		return NULL;
+	for (side = FLT_SIDE_REQ; side <= FLT_SIDE_GLOBAL; side <<= 1) {
+		ds = flt_inst_side(inst, side);
+		LIST_INIT(&ds->reordered_before);
+		LIST_INIT(&ds->reordered_after);
+		LIST_INIT(&ds->list);
+	}
+	return inst;
+}
+
+/* Frees a filter instance and all its content */
+static void flt_free_instance(struct filter_instance *inst)
+{
+	if (!inst)
+		return;
+	if (LIST_INLIST(&inst->global.list))
+		LIST_DELETE(&inst->global.list);
+	if (LIST_INLIST(&inst->req.list))
+		LIST_DELETE(&inst->req.list);
+	if (LIST_INLIST(&inst->res.list))
+		LIST_DELETE(&inst->res.list);
+	if (inst->conf.argv) {
+		int i;
+
+		for (i = 0; i < inst->conf.argc; i++)
+			free(inst->conf.argv[i]);
+		free(inst->conf.argv);
+	}
+	free(inst->conf.file);
+	free((void *)inst->id);
+	free(inst->fconf);
+	free(inst);
+}
+
+/* Frees a filter_enabled element */
+static void flt_free_enabled(struct filter_enabled *flt_en)
+{
+	if (!flt_en)
+		return;
+	if (LIST_INLIST(&flt_en->list))
+		LIST_DELETE(&flt_en->list);
+	free((void *)flt_en->cls_name);
+	free((void *)flt_en->id);
+	free(flt_en->file);
+	free(flt_en);
+}
+
+/* Frees a filter_sequence element */
+static void flt_free_sequence(struct filter_sequence *flt_seq)
+{
+	if (!flt_seq)
+		return;
+	if (LIST_INLIST(&flt_seq->list))
+		LIST_DELETE(&flt_seq->list);
+	free((void *)flt_seq->cls_name);
+	free((void *)flt_seq->id);
+	free((void *)flt_seq->cls_ref_name);
+	free((void *)flt_seq->ref_id);
+	free(flt_seq->file);
+	free(flt_seq);
+}
+
+/* Unlink one side recursively. Only the global list owns the instances:
+ * both sides must be detached before releasing any instance.
+ */
+static void flt_free_inst_list(struct list *instances, unsigned int side)
+{
+	struct filter_instance *inst;
+	struct filter_inst_side *ds;
+
+	while (!LIST_ISEMPTY(instances)) {
+		inst = flt_inst_from_list(instances->n, side);
+		ds = flt_inst_side(inst, side);
+		flt_free_inst_list(&ds->reordered_before, side);
+		flt_free_inst_list(&ds->reordered_after, side);
+		LIST_DEL_INIT(&ds->list);
+		if (side == FLT_SIDE_GLOBAL)
+			flt_free_instance(inst);
+	}
+}
+
+/*
+ * The API below is similar to flt_list_start() and flt_list_next() except that it can be
+ * interrupted and resumed!
+ *
+ * - resume_filter_list_start() and resume_filter_list_next() must always be used together.
+ *   The first one sets the first filter value and the second one allows to get the
+ *   next one until NULL is returned
+ *
+ * - resume_filter_list_break() must be used to break the iteration and set the filter
+ *   from which to resume the next time (that is, resume_filter_list_start() will allow
+ *   to resume from value at the time of the break)
+ *
+ *  Here is an example:
+ *
+ *    struct filter *filter;
+ *
+ *    for (filter = resume_filter_list_start(stream, channel); filter
+ *         filter = resume_filter_list_next(stream, channel, filter)) {
+ *	...
+ *	if (cond) {
+ *		resume_filter_list_break(stream, channel, filter, ret);
+		goto label;
+ *      }
+ *    }
+ *    ...
+ *     label:
+ *    ...
+ *
+ */
+static inline struct filter *resume_filter_list_start(struct stream *strm, struct channel *chn)
+{
+	struct filter *filter;
+
+	if (chn->flt.current) {
+		filter = chn->flt.current;
+		if (!(chn_prod(chn)->flags & SC_FL_ERROR) &&
+		    !(chn->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT))) {
+			(strm)->waiting_entity.type = STRM_ENTITY_NONE;
+			(strm)->waiting_entity.ptr = NULL;
+		}
+	}
+	else {
+		filter = flt_list_start(strm, chn);
+		chn->flt.current = filter;
+	}
+
+	return filter;
+}
+
+static inline struct filter *resume_filter_list_next(struct stream *strm, struct channel *chn,
+                                                     struct filter *filter)
+{
+	filter = flt_list_next(strm, chn, filter);
+	chn->flt.current = filter;
+	return filter;
+}
+
+static inline void resume_filter_list_break(struct stream *strm, struct channel *chn,
+                                            struct filter *filter, int ret)
+{
+	chn->flt.current = NULL;
+	if (ret == 0) {
+		strm->waiting_entity.type = STRM_ENTITY_FILTER;
+		strm->waiting_entity.ptr  = filter;
+		chn->flt.current = filter;
+	}
+	else if (ret < 0) {
+		strm->last_entity.type = STRM_ENTITY_FILTER;
+		strm->last_entity.ptr = filter;
+	}
+}
+
+/* List head of all known filter keywords */
+static struct flt_kw_list flt_keywords = {
+	.list = LIST_HEAD_INIT(flt_keywords.list)
+};
+
+/*
+ * Registers the filter keyword list <kwl> as a list of valid keywords for next
+ * parsing sessions.
+ */
+void
+flt_register_keywords(struct flt_kw_list *kwl)
+{
+	LIST_APPEND(&flt_keywords.list, &kwl->list);
+}
+
+/*
+ * Returns a pointer to the filter keyword <kw>, or NULL if not found. If the
+ * keyword is found with a NULL ->parse() function, then an attempt is made to
+ * find one with a valid ->parse() function. This way it is possible to declare
+ * platform-dependant, known keywords as NULL, then only declare them as valid
+ * if some options are met. Note that if the requested keyword contains an
+ * opening parenthesis, everything from this point is ignored.
+ */
+struct flt_kw *
+flt_find_kw(const char *kw)
+{
+	int index;
+	const char *kwend;
+	struct flt_kw_list *kwl;
+	struct flt_kw *ret = NULL;
+
+	kwend = strchr(kw, '(');
+	if (!kwend)
+		kwend = kw + strlen(kw);
+
+	list_for_each_entry(kwl, &flt_keywords.list, list) {
+		for (index = 0; kwl->kw[index].kw != NULL; index++) {
+			if ((strncmp(kwl->kw[index].kw, kw, kwend - kw) == 0) &&
+			    kwl->kw[index].kw[kwend-kw] == 0) {
+				if (kwl->kw[index].parse)
+					return &kwl->kw[index]; /* found it !*/
+				else
+					ret = &kwl->kw[index];  /* may be OK */
+			}
+		}
+	}
+	return ret;
+}
+
+/*
+ * Dumps all registered "filter" keywords to the <out> string pointer. The
+ * unsupported keywords are only dumped if their supported form was not found.
+ * If <out> is NULL, the output is emitted using a more compact format on stdout.
+ */
+void
+flt_dump_kws(char **out)
+{
+	struct flt_kw_list *kwl;
+	const struct flt_kw *kwp, *kw;
+	const char *scope = NULL;
+	int index;
+
+	if (out)
+		*out = NULL;
+
+	for (kw = kwp = NULL;; kwp = kw) {
+		list_for_each_entry(kwl, &flt_keywords.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if ((kwl->kw[index].parse ||
+				     flt_find_kw(kwl->kw[index].kw) == &kwl->kw[index])
+				    && strordered(kwp ? kwp->kw : NULL,
+						  kwl->kw[index].kw,
+						  kw != kwp ? kw->kw : NULL)) {
+					kw = &kwl->kw[index];
+					scope = kwl->scope;
+				}
+			}
+		}
+
+		if (kw == kwp)
+			break;
+
+		if (out)
+			memprintf(out, "%s[%4s] %s%s\n", *out ? *out : "",
+				  scope,
+				  kw->kw,
+				  kw->parse ? "" : " (not supported)");
+		else
+			printf("%s [%s]\n",
+			       kw->kw, scope);
+	}
+}
+
+/*
+ * Lists the known filter classes on <out>, in their global order
+ */
+void
+list_filter_classes(FILE *out)
+{
+	struct filter_class *cls;
+	int first = 1;
+
+	fprintf(out, "Available filter classes :\n\t");
+	list_for_each_entry(cls, &filter_classes, list) {
+		fprintf(out, "%s%s", first ? "" : ", ", cls->name);
+		first = 0;
+	}
+	if (first)
+		fprintf(out, "<none>");
+	fprintf(out, "\n");
+}
+
+/* Returns 1 if the proxy <px> has at least one active filter, legacy or
+ * not. Must be called after the class references are flattened.
+ */
+int flt_has_filter(const struct proxy *px)
+{
+	return (!LIST_ISEMPTY(&px->filter_configs) || !LIST_ISEMPTY(&px->filter_instances));
+}
+
+/* Checks for explicit filter instances or enable/sequence directives during
+ * configuration parsing, before the class references are flattened. Inherited
+ * directives count too, but implicit instances do not select a config mode.
+ */
+int flt_has_explicit_config(const struct proxy *px)
+{
+	struct filter_class_ref *ref;
+	struct filter_instance *inst;
+
+	if (!LIST_ISEMPTY(&px->conf.filter_enabled) || !LIST_ISEMPTY(&px->conf.filter_sequences))
+		return 1;
+
+	list_for_each_entry(ref, &px->conf.filter_refs, list) {
+		list_for_each_entry(inst, &ref->instances, global.list) {
+			if (!(inst->flags & FLT_INST_F_IMPLICIT))
+				return 1;
+		}
+	}
+	return 0;
+}
+
+/* Reject mixing an explicit legacy "filter" declaration with "filter-*"
+ * directives in the same proxy. Implicit filters may coexist with either mode.
+ */
+static int flt_check_config_mode(struct proxy *px, int legacy, char **err)
+{
+	if (legacy) {
+		if (flt_has_explicit_config(px))
+			goto error;
+	}
+	else if (flt_use_legacy_filter(px))
+		goto error;
+	return 0;
+
+  error:
+	memprintf(err, "'filter' and 'filter-*' directives cannot be used together in the same proxy (including inherited directives).");
+	return -1;
+}
+
+/*
+ * Parses the "filter" keyword. All keywords must be handled by filters
+ * themselves
+ */
+static int
+parse_filter(char **args, int section_type, struct proxy *curpx,
+	     const struct proxy *defpx, const char *file, int line, char **err)
+{
+	struct flt_conf *fconf = NULL;
+
+	/* Filter cannot be defined on a default proxy */
+	if (curpx == defpx) {
+		memprintf(err, "parsing [%s:%d] : %s is not allowed in a 'default' section.",
+			  file, line, args[0]);
+		return -1;
+	}
+	if (flt_check_config_mode(curpx, 1, err) < 0)
+		return -1;
+
+	if (strcmp(args[0], "filter") == 0) {
+		struct flt_kw *kw;
+		int cur_arg;
+
+		curpx->flags |= PR_FL_FILTER_LEGACY;
+		if (!*args[1]) {
+			memprintf(err,
+				  "parsing [%s:%d] : missing argument for '%s' in %s '%s'.",
+				  file, line, args[0], proxy_type_str(curpx), curpx->id);
+			goto error;
+		}
+		fconf = calloc(1, sizeof(*fconf));
+		if (!fconf) {
+			memprintf(err, "'%s' : out of memory", args[0]);
+			goto error;
+		}
+
+		cur_arg = 1;
+		kw = flt_find_kw(args[cur_arg]);
+		if (kw) {
+			if (!kw->parse) {
+				memprintf(err, "parsing [%s:%d] : '%s' : "
+					  "'%s' option is not implemented in this version (check build options).",
+					  file, line, args[0], args[cur_arg]);
+				goto error;
+			}
+			if (kw->parse(args, &cur_arg, curpx, fconf, err, kw->private) != 0) {
+				if (err && *err)
+					memprintf(err, "'%s' : %s",
+						  args[0], *err);
+				else
+					memprintf(err, "'%s' : error encountered while processing '%s'",
+						  args[0], args[cur_arg]);
+				goto error;
+			}
+		}
+		else {
+			flt_dump_kws(err);
+			indent_msg(err, 4);
+			memprintf(err, "'%s' : unknown keyword '%s'.%s%s",
+			          args[0], args[cur_arg],
+			          err && *err ? " Registered keywords :" : "", err && *err ? *err : "");
+			goto error;
+		}
+		if (*args[cur_arg]) {
+			memprintf(err, "'%s %s' : unknown keyword '%s'.",
+			          args[0], args[1], args[cur_arg]);
+			goto error;
+		}
+		if (fconf->ops == NULL) {
+			memprintf(err, "'%s %s' : no callbacks defined.",
+			          args[0], args[1]);
+			goto error;
+		}
+
+		fconf->flags |= FLT_CFG_FL_EXPLICIT;
+		flt_conf_add(curpx, fconf);
+	}
+	return 0;
+
+  error:
+	free(fconf);
+	return -1;
+
+
+}
+
+/*
+ * Calls 'init' callback for all filters attached to a proxy. This happens after
+ * the configuration parsing. Filters can finish to fill their config. Returns
+ * (ERR_ALERT|ERR_FATAL) if an error occurs, 0 otherwise.
+ *
+ * Legacy configurations may still be referenced by rules in instance mode,
+ * so both configuration lists are initialized. Stream attachment selects one
+ * model using PR_FL_FILTER_LEGACY.
+ */
+static int
+flt_init(struct proxy *proxy)
+{
+	struct filter_instance *inst;
+	struct flt_conf *fconf;
+
+	if (flt_use_legacy_filter(proxy)) {
+		list_for_each_entry(fconf, &proxy->filter_configs, list) {
+			if (fconf->ops->init && fconf->ops->init(proxy, fconf) < 0)
+				return ERR_ALERT|ERR_FATAL;
+		}
+	}
+	else {
+		list_for_each_entry(inst, &proxy->filter_instances, global.list) {
+			fconf = inst->fconf;
+			if (!fconf)
+				continue;
+			if (fconf->ops->init && fconf->ops->init(proxy, fconf) < 0)
+				return ERR_ALERT|ERR_FATAL;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Calls 'init_per_thread' callback for all filters attached to a proxy for each
+ * threads. This happens after the thread creation. Filters can finish to fill
+ * their config. Returns (ERR_ALERT|ERR_FATAL) if an error occurs, 0 otherwise.
+ *
+ * As with flt_init(), both configuration lists are initialized while rules
+ * can still reference legacy configurations in instance mode.
+ */
+static int
+flt_init_per_thread(struct proxy *proxy)
+{
+	struct filter_instance *inst;
+	struct flt_conf *fconf;
+
+	if (flt_use_legacy_filter(proxy)) {
+		list_for_each_entry(fconf, &proxy->filter_configs, list) {
+			if (fconf->ops->init_per_thread && fconf->ops->init_per_thread(proxy, fconf) < 0)
+				return ERR_ALERT|ERR_FATAL;
+		}
+	}
+	else {
+		list_for_each_entry(inst, &proxy->filter_instances, global.list) {
+			fconf = inst->fconf;
+			if (!fconf)
+				continue;
+			if (fconf->ops->init_per_thread && fconf->ops->init_per_thread(proxy, fconf) < 0)
+				return ERR_ALERT|ERR_FATAL;
+		}
+	}
+	return 0;
+}
+
+/* Calls flt_init() for all proxies, see above */
+static int
+flt_init_all()
+{
+	struct proxy *px;
+	int err_code = ERR_NONE;
+
+	list_for_each_entry(px, &main_proxies, el) {
+		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+			continue;
+
+		err_code |= flt_init(px);
+		if (err_code & (ERR_ABORT|ERR_FATAL)) {
+			ha_alert("Failed to initialize filters for proxy '%s'.\n",
+				 px->id);
+			return err_code;
+		}
+	}
+	return 0;
+}
+
+/* Calls flt_init_per_thread() for all proxies, see above.  Be careful here, it
+ * returns 0 if an error occurred. This is the opposite of flt_init_all. */
+static int
+flt_init_all_per_thread()
+{
+	struct proxy *px;
+	int err_code = 0;
+
+	list_for_each_entry(px, &main_proxies, el) {
+		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+			continue;
+
+		err_code = flt_init_per_thread(px);
+		if (err_code & (ERR_ABORT|ERR_FATAL)) {
+			ha_alert("Failed to initialize filters for proxy '%s' for thread %u.\n",
+				 px->id, tid);
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* Returns 1 if the filter config <fconf> is one of the core filters whose
+ * position is automatically ordered when they are implicitly declared on
+ * a proxy (the decompression, cache, compression and fcgi filters), 0
+ * otherwise.
+ */
+static int flt_is_core_flt(const struct flt_conf *fconf)
+{
+	return (fconf->id == decomp_req_flt_id || fconf->id == decomp_res_flt_id ||
+	        fconf->id == cache_store_flt_id ||
+	        fconf->id == http_comp_req_flt_id || fconf->id == http_comp_res_flt_id
+#if defined(USE_FCGI)
+	        || fconf->id == fcgi_flt_id
+#endif
+	       );
+}
+
+/* Returns the ordering class of the filter config <fconf> for the order
+ * <side>: the implicit core filters are ordered as follows
+ *
+ *   global:   decomp-req > decomp-res > cache-store > any other filter >
+ *             http-comp-req > http-comp-res > fcgi
+ *
+ *   request:  decomp-req > any other filter > http-comp-res > decomp-res >
+ *             http-comp-req > fcgi
+ *
+ *   response: fcgi > decomp-res > cache-store > any other filter >
+ *             decomp-req > http-comp-res
+ *
+ * Explicitly declared core filters are never moved and act as segment
+ * boundaries (see flt_reorder_implicit_conf()).
+ */
+static int flt_order_class(const struct flt_conf *fconf, unsigned int side)
+{
+	int is_comp_req = (fconf->id == http_comp_req_flt_id);
+	int is_comp_res = (fconf->id == http_comp_res_flt_id);
+	int is_decomp_req = (fconf->id == decomp_req_flt_id);
+	int is_decomp_res = (fconf->id == decomp_res_flt_id);
+	int is_cache = (fconf->id == cache_store_flt_id);
+#if defined(USE_FCGI)
+	int is_fcgi = (fconf->id == fcgi_flt_id);
+#endif
+
+	switch (side) {
+	case FLT_SIDE_REQ:
+		if (is_decomp_req)
+			return 0;
+		if (is_comp_res)
+			return 2;
+		if (is_decomp_res)
+			return 3;
+		if (is_comp_req)
+			return 4;
+#if defined(USE_FCGI)
+		if (is_fcgi)
+			return 5;
+#endif
+		return 1; /* any other filter */
+
+	case FLT_SIDE_RES:
+#if defined(USE_FCGI)
+		if (is_fcgi)
+			return 0;
+#endif
+		if (is_decomp_res)
+			return 1;
+		if (is_cache)
+			return 2;
+		if (is_decomp_req)
+			return 4;
+		if (is_comp_res)
+			return 5;
+		return 3; /* any other filter */
+
+	default:
+		/* global order */
+		if (is_decomp_req || is_decomp_res)
+			return 0;
+		if (is_cache)
+			return 1;
+		if (is_comp_req || is_comp_res)
+			return 3;
+#if defined(USE_FCGI)
+		if (is_fcgi)
+			return 4;
+#endif
+		return 2; /* any other filter */
+	}
+}
+
+/* Appends at the end of <out> all the filter configs pending in the ordering
+ * buckets <seg>, in class order, and empties the buckets.
+ */
+static void flt_flush_order_segs(struct list *out, struct list seg[], int nb_seg)
+{
+	int i;
+
+	for (i = 0; i < nb_seg; i++) {
+		while (!LIST_ISEMPTY(&seg[i])) {
+			struct list *el = seg[i].n;
+
+			LIST_DEL_INIT(el);
+			LIST_APPEND(out, el);
+		}
+	}
+}
+
+/* Reorders the implicitly declared core filter configs of the legacy proxy <px>
+ * to force the canonical filter orders. Three independent orders are filled,
+ * respectively with the 'list', 'by_req' and 'by_res' members of the filter
+ * configs
+ *
+ * The global order (px->filter_configs) is used for the side-independent
+ * operations (configuration checks, initialization and destruction). The
+ * request and response orders (px->filters_req_configs and
+ * px->filters_res_configs) are used to fill the stream's request and response
+ * filter lists.
+ *
+ * Explicitly declared core filters are never moved, they keep their declaration
+ * order. They delimit segments of filters inside which the implicitly declared
+ * core filters are sorted, so that an implicit filter never crosses an
+ * explicitly declared one.
+ */
+static void flt_reorder_implicit_conf(struct proxy *px)
+{
+	struct flt_conf *fconf, *back;
+	struct list out, seg[3][6];
+	int i, s;
+
+	for (s = 0; s < 3; s++) {
+		for (i = 0; i < 6; i++)
+			LIST_INIT(&seg[s][i]);
+	}
+
+	/* First, the global order, with the 'list' member. */
+	LIST_INIT(&out);
+	list_for_each_entry_safe(fconf, back, &px->filter_configs, list) {
+		if ((fconf->flags & FLT_CFG_FL_EXPLICIT) && flt_is_core_flt(fconf)) {
+			/* Explicitly declared core filter: flush the current
+			 * segment before it and keep the filter in place.
+			 */
+			flt_flush_order_segs(&out, seg[0], 6);
+			LIST_DEL_INIT(&fconf->list);
+			LIST_APPEND(&out, &fconf->list);
+			continue;
+		}
+		LIST_DEL_INIT(&fconf->list);
+		LIST_APPEND(&seg[0][flt_order_class(fconf, FLT_SIDE_GLOBAL)], &fconf->list);
+	}
+	flt_flush_order_segs(&out, seg[0], 6);
+	LIST_SPLICE(&px->filter_configs, &out);
+
+	/* Then the request and response orders, from the final global order,
+	 * with the 'by_req' and 'by_res' members. Both lists are rebuilt from
+	 * scratch: reset their heads, all the links were initialized by
+	 * flt_conf_add()/flt_conf_insert() or above.
+	 */
+	LIST_INIT(&px->filters_req_configs);
+	LIST_INIT(&px->filters_res_configs);
+	list_for_each_entry_safe(fconf, back, &px->filter_configs, list) {
+		if ((fconf->flags & FLT_CFG_FL_EXPLICIT) && flt_is_core_flt(fconf)) {
+			/* Explicitly declared core filter: flush the current
+			 * segments before it and keep the filter in place.
+			 */
+			flt_flush_order_segs(&px->filters_req_configs, seg[1], 6);
+			flt_flush_order_segs(&px->filters_res_configs, seg[2], 6);
+			LIST_APPEND(&px->filters_req_configs, &fconf->by_req);
+			LIST_APPEND(&px->filters_res_configs, &fconf->by_res);
+			continue;
+		}
+		LIST_APPEND(&seg[1][flt_order_class(fconf, FLT_SIDE_REQ)], &fconf->by_req);
+		LIST_APPEND(&seg[2][flt_order_class(fconf, FLT_SIDE_RES)], &fconf->by_res);
+	}
+	flt_flush_order_segs(&px->filters_req_configs, seg[1], 6);
+	flt_flush_order_segs(&px->filters_res_configs, seg[2], 6);
+}
+
+/*
+ * Calls 'check' callback for all filters attached to a proxy. This happens
+ * after the configuration parsing but before filters initialization. Returns
+ * the number of encountered errors.
+ */
+int
+flt_check(struct proxy *proxy)
+{
+	struct flt_conf *fconf;
+	int err = 0;
+
+	if (!flt_use_legacy_filter(proxy))
+		goto end;
+
+	err += check_implicit_decomp_flt(proxy);
+	err += check_implicit_http_comp_flt(proxy);
+	flt_reorder_implicit_conf(proxy);
+	list_for_each_entry(fconf, &proxy->filter_configs, list) {
+		if (fconf->ops->check)
+			err += fconf->ops->check(proxy, fconf);
+	}
+  end:
+	return err;
+}
+
+/* Calls 'check' callback for all finalized filter instances of the proxy
+ * <px>, during the post-proxy-check stage (the instances are not
+ * finalized yet during the configuration checks, see flt_check()). Returns
+ * a combination of ERR_* flags, ERR_NONE on success.
+ */
+static int flt_check_instances(struct proxy *px)
+{
+	struct filter_instance *inst;
+	struct flt_conf *fconf;
+	int err = 0;
+
+	if (flt_use_legacy_filter(px))
+		goto end;
+
+	list_for_each_entry(inst, &px->filter_instances, global.list) {
+		fconf = inst->fconf;
+		if (!fconf)
+			continue;
+		if (fconf->ops->check)
+			err += fconf->ops->check(px, fconf);
+	}
+	if (err)
+		err = ERR_ALERT | ERR_FATAL;
+  end:
+	return err;
+}
+
+/*
+ * Calls 'deinit' callback for all filters attached to a proxy. This happens
+ * when HAProxy is stopped.
+ *
+ * Both configuration lists must be released, independently of the model
+ * selected for stream attachment.
+ */
+void
+flt_deinit(struct proxy *proxy)
+{
+	struct filter_instance *inst;
+	struct flt_conf *fconf, *back;
+
+	list_for_each_entry_safe(fconf, back, &proxy->filter_configs, list) {
+		if (fconf->ops->deinit)
+			fconf->ops->deinit(proxy, fconf);
+		LIST_DELETE(&fconf->list);
+		LIST_DELETE(&fconf->by_req);
+		LIST_DELETE(&fconf->by_res);
+		free(fconf);
+	}
+	list_for_each_entry(inst, &proxy->filter_instances, global.list) {
+		fconf = inst->fconf;
+		if (fconf && fconf->ops && fconf->ops->deinit)
+			fconf->ops->deinit(proxy, fconf);
+	}
+	flt_free_instances(proxy);
+}
+
+/*
+ * Calls 'deinit_per_thread' callback for all filters attached to a proxy for
+ * each threads. This happens before exiting a thread.
+ *
+ * The callback uses the same configuration model as flt_init_per_thread():
+ * legacy configurations or finalized instances in global order.
+ */
+void
+flt_deinit_per_thread(struct proxy *proxy)
+{
+	struct filter_instance *inst;
+	struct flt_conf *fconf, *back;
+
+	if (flt_use_legacy_filter(proxy)) {
+		list_for_each_entry_safe(fconf, back, &proxy->filter_configs, list) {
+			if (fconf->ops->deinit_per_thread)
+				fconf->ops->deinit_per_thread(proxy, fconf);
+		}
+	}
+	else {
+		list_for_each_entry(inst, &proxy->filter_instances, global.list) {
+			fconf = inst->fconf;
+			if (!fconf)
+				continue;
+			if (fconf->ops->deinit_per_thread)
+				fconf->ops->deinit_per_thread(proxy, fconf);
+		}
+	}
+}
+
+
+/* Calls flt_deinit_per_thread() for all proxies, see above */
+static void
+flt_deinit_all_per_thread()
+{
+	struct proxy *px;
+
+	list_for_each_entry(px, &main_proxies, el)
+		flt_deinit_per_thread(px);
+}
+
+/* Attach a filter in global stream order. The channel lists are filled by
+ * the caller, from the proxy's per-side orders.
+ * Returns -1 on error, 0 on success (including filters declining attachment).
+ */
+static int
+flt_stream_add_filter(struct stream *s, struct flt_conf *fconf, unsigned int flags)
+{
+	struct filter *f;
+
+	if (IS_HTX_STRM(s) && !(fconf->flags & FLT_CFG_FL_HTX))
+		return 0;
+
+	f = pool_zalloc(pool_head_filter);
+	if (!f) /* not enough memory */
+		return -1;
+	f->config = fconf;
+	f->flags |= flags;
+	LIST_INIT(&f->list);
+	LIST_INIT(&f->req_list);
+	LIST_INIT(&f->res_list);
+
+	if (FLT_OPS(f)->attach) {
+		struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, f->config);
+		int ret = EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(f)->attach(s, f));
+		if (ret <= 0) {
+			pool_free(pool_head_filter, f);
+			return ret;
+		}
+	}
+
+	LIST_APPEND(&strm_flt(s)->filters, &f->list);
+
+	strm_flt(s)->flags |= STRM_FLT_FL_HAS_FILTERS;
+	return 0;
+}
+
+/* Attach one proxy's filters, preserving the frontend prefix when adding a
+ * backend. Each enabled filter instance is instantiated once in global order.
+ * Find the successfully attached stream filter instances by their unique
+ * configuration pointers to build the channel lists; disabled, incompatible
+ * or declined filters have no stream filter instance to link. Never store
+ * per-stream pointers in shared filter instances.
+ *
+ * The request list is always filled in the proxy's request order. The
+ * response list is filled in the proxy's response order for the frontend
+ * filters, but the backend filters are prepended, so a response reaches the
+ * backend filters before the frontend ones.
+ */
+static int flt_stream_add_proxy_filters(struct stream *s, struct proxy *px, unsigned int flags)
+{
+	struct filter_instance *inst;
+	struct flt_conf *fconf;
+	struct filter *filter;
+
+	if (flt_use_legacy_filter(px)) {
+		/* The attach callbacks are called in the global order, then
+		 * the stream's request and response filter lists are filled
+		 * with the proxy's request and response orders. The backend
+		 * filters are prepended to the response list, so they are
+		 * evaluated before the frontend filters: a response reaches
+		 * the backend filters first.
+		 */
+		list_for_each_entry(fconf, &px->filter_configs, list) {
+			if (flt_stream_add_filter(s, fconf, flags) < 0)
+				return -1;
+		}
+		list_for_each_entry(fconf, &px->filters_req_configs, by_req) {
+			list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+				if (filter->config == fconf) {
+					LIST_APPEND(&s->req.flt.filters, &filter->req_list);
+					break;
+				}
+			}
+		}
+		if (flags & FLT_FL_IS_BACKEND_FILTER) {
+			list_for_each_entry_rev(fconf, &px->filters_res_configs, by_res) {
+				list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+					if (filter->config == fconf) {
+						LIST_INSERT(&s->res.flt.filters, &filter->res_list);
+						break;
+					}
+				}
+			}
+		}
+		else {
+			list_for_each_entry(fconf, &px->filters_res_configs, by_res) {
+				list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+					if (filter->config == fconf) {
+						LIST_APPEND(&s->res.flt.filters, &filter->res_list);
+						break;
+					}
+				}
+			}
+		}
+		return 0;
+	}
+
+	list_for_each_entry(inst, &px->filter_instances, global.list) {
+		if (!inst->enabled || !inst->fconf)
+			continue;
+		if (flt_stream_add_filter(s, inst->fconf, flags) < 0)
+			return -1;
+	}
+
+	list_for_each_entry(inst, &px->filter_req_instances, req.list) {
+		if (!inst->enabled || !inst->fconf)
+			continue;
+		list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+			if (filter->config == inst->fconf) {
+				LIST_APPEND(&s->req.flt.filters, &filter->req_list);
+				break;
+			}
+		}
+	}
+	if (flags & FLT_FL_IS_BACKEND_FILTER) {
+		list_for_each_entry_rev(inst, &px->filter_res_instances, res.list) {
+			if (!inst->enabled || !inst->fconf)
+				continue;
+			list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+				if (filter->config == inst->fconf) {
+					LIST_INSERT(&s->res.flt.filters, &filter->res_list);
+					break;
+				}
+			}
+		}
+	}
+	else {
+		list_for_each_entry(inst, &px->filter_res_instances, res.list) {
+			if (!inst->enabled || !inst->fconf)
+				continue;
+			list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+				if (filter->config == inst->fconf) {
+					LIST_APPEND(&s->res.flt.filters, &filter->res_list);
+					break;
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Called when a stream is created. It attaches all frontend filters to the
+ * stream. Returns -1 if an error occurs, 0 otherwise.
+ */
+int
+flt_stream_init(struct stream *s)
+{
+	memset(strm_flt(s), 0, sizeof(*strm_flt(s)));
+	LIST_INIT(&strm_flt(s)->filters);
+	memset(&s->req.flt, 0, sizeof(s->req.flt));
+	LIST_INIT(&s->req.flt.filters);
+	memset(&s->res.flt, 0, sizeof(s->res.flt));
+	LIST_INIT(&s->res.flt.filters);
+	return flt_stream_add_proxy_filters(s, strm_fe(s), 0);
+}
+
+/*
+ * Called when a stream is closed or when analyze ends (For an HTTP stream, this
+ * happens after each request/response exchange). When analyze ends, backend
+ * filters are removed. When the stream is closed, all filters attached to the
+ * stream are removed.
+ */
+void
+flt_stream_release(struct stream *s, int only_backend)
+{
+	struct filter *filter, *back;
+
+	list_for_each_entry_safe(filter, back, &strm_flt(s)->filters, list) {
+		if (!only_backend || (filter->flags & FLT_FL_IS_BACKEND_FILTER)) {
+			filter->calls++;
+			if (FLT_OPS(filter)->detach) {
+				struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+				EXEC_CTX_NO_RET(exec_ctx, FLT_OPS(filter)->detach(s, filter));
+			}
+			LIST_DELETE(&filter->list);
+			LIST_DELETE(&filter->req_list);
+			LIST_DELETE(&filter->res_list);
+			pool_free(pool_head_filter, filter);
+		}
+	}
+	if (LIST_ISEMPTY(&strm_flt(s)->filters))
+		strm_flt(s)->flags &= ~STRM_FLT_FL_HAS_FILTERS;
+}
+
+/*
+ * Calls 'stream_start' for all filters attached to a stream. This happens when
+ * the stream is created, just after calling flt_stream_init
+ * function. Returns -1 if an error occurs, 0 otherwise.
+ */
+int
+flt_stream_start(struct stream *s)
+{
+	struct filter *filter;
+
+	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+		if (FLT_OPS(filter)->stream_start) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			filter->calls++;
+			if (EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->stream_start(s, filter) < 0)) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
+				return -1;
+			}
+		}
+	}
+	if (strm_li(s) && (strm_li(s)->bind_conf->analysers & AN_REQ_FLT_START_FE)) {
+		s->req.flags |= CF_FLT_ANALYZE;
+		s->req.analysers |= AN_REQ_FLT_END;
+	}
+	return 0;
+}
+
+/*
+ * Calls 'stream_stop' for all filters attached to a stream. This happens when
+ * the stream is stopped, just before calling flt_stream_release function.
+ */
+void
+flt_stream_stop(struct stream *s)
+{
+	struct filter *filter;
+
+	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+		if (FLT_OPS(filter)->stream_stop) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			filter->calls++;
+			EXEC_CTX_NO_RET(exec_ctx, FLT_OPS(filter)->stream_stop(s, filter));
+		}
+	}
+}
+
+/*
+ * Calls 'check_timeouts' for all filters attached to a stream. This happens when
+ * the stream is woken up because of expired timer.
+ */
+void
+flt_stream_check_timeouts(struct stream *s)
+{
+	struct filter *filter;
+
+	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+		if (FLT_OPS(filter)->check_timeouts) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			filter->calls++;
+			EXEC_CTX_NO_RET(exec_ctx, FLT_OPS(filter)->check_timeouts(s, filter));
+		}
+	}
+}
+
+/*
+ * Called when a backend is set for a stream. If the frontend and the backend
+ * are not the same, this function attaches all backend filters to the
+ * stream. Returns -1 if an error occurs, 0 otherwise.
+ */
+int
+flt_set_stream_backend(struct stream *s, struct proxy *be)
+{
+	struct filter *filter;
+
+	if (strm_fe(s) == be)
+		goto end;
+
+	if (flt_stream_add_proxy_filters(s, be, FLT_FL_IS_BACKEND_FILTER) < 0)
+		return -1;
+
+  end:
+	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+		if (FLT_OPS(filter)->stream_set_backend) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			filter->calls++;
+			if (EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->stream_set_backend(s, filter, be) < 0)) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
+				return -1;
+			}
+		}
+	}
+	if (be->be_req_ana & AN_REQ_FLT_START_BE) {
+		s->req.flags |= CF_FLT_ANALYZE;
+		s->req.analysers |= AN_REQ_FLT_END;
+	}
+	if ((strm_fe(s)->fe_rsp_ana | be->be_rsp_ana) & (AN_RES_FLT_START_FE|AN_RES_FLT_START_BE)) {
+		s->res.flags |= CF_FLT_ANALYZE;
+		s->res.analysers |= AN_RES_FLT_END;
+	}
+
+	return 0;
+}
+
+
+/*
+ * Calls 'http_end' callback for all filters attached to a stream. All filters
+ * are called here, but only if there is at least one "data" filter. This
+ * functions is called when all data were parsed and forwarded. 'http_end'
+ * callback is resumable, so this function returns a negative value if an error
+ * occurs, 0 if it needs to wait for some reason, any other value otherwise.
+ */
+int
+flt_http_end(struct stream *s, struct http_msg *msg)
+{
+	struct filter *filter;
+	unsigned long long *strm_off = &FLT_STRM_OFF(s, msg->chn);
+	unsigned int offset = 0;
+	int ret = 1;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s,
+			s->txn.http, msg);
+	for (filter = resume_filter_list_start(s, msg->chn); filter;
+	     filter = resume_filter_list_next(s, msg->chn, filter)) {
+		unsigned long long flt_off = FLT_OFF(filter, msg->chn);
+		offset = flt_off - *strm_off;
+
+		/* Call http_end for data filters only. But the filter offset is
+		 * still valid for all filters
+		 . */
+		if (!IS_DATA_FILTER(filter, msg->chn))
+			continue;
+
+		if (FLT_OPS(filter)->http_end) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
+			ret = EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->http_end(s, filter, msg));
+			if (ret <= 0) {
+				resume_filter_list_break(s, msg->chn, filter, ret);
+				goto end;
+			}
+		}
+	}
+
+	c_adv(msg->chn, offset);
+	*strm_off += offset;
+
+end:
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+	return ret;
+}
+
+/*
+ * Calls 'http_reset' callback for all filters attached to a stream. This
+ * happens when a 1xx informational response is received, and on the response
+ * when the request is sent again for a L7 retry.
+ */
+void
+flt_http_reset(struct stream *s, struct http_msg *msg)
+{
+	struct filter *filter;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s,
+			s->txn.http, msg);
+	for (filter = flt_list_start(s, msg->chn); filter;
+	     filter = flt_list_next(s, msg->chn, filter)) {
+		if (FLT_OPS(filter)->http_reset) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
+			EXEC_CTX_NO_RET(exec_ctx, FLT_OPS(filter)->http_reset(s, filter, msg));
+		}
+	}
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+}
+
+/*
+ * Calls 'http_reply' callback for all filters attached to a stream when HA
+ * decides to stop the HTTP message processing.
+ */
+void
+flt_http_reply(struct stream *s, short status, const struct buffer *msg)
+{
+	struct filter *filter;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s,
+			s->txn.http, msg);
+	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
+		if (FLT_OPS(filter)->http_reply) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
+			EXEC_CTX_NO_RET(exec_ctx, FLT_OPS(filter)->http_reply(s, filter, status, msg));
+		}
+	}
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+}
+
+/*
+ * Calls 'http_payload' callback for all "data" filters attached to a
+ * stream. This function is called when some data can be forwarded in the
+ * AN_REQ_HTTP_XFER_BODY and AN_RES_HTTP_XFER_BODY analyzers. It takes care to
+ * update the filters and the stream offset to be sure that a filter cannot
+ * forward more data than its predecessors. A filter can choose to not forward
+ * all data. Returns a negative value if an error occurs, else the number of
+ * forwarded bytes.
+ */
+int
+flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
+{
+	struct filter *filter;
+	unsigned long long *strm_off = &FLT_STRM_OFF(s, msg->chn);
+	unsigned int out = co_data(msg->chn);
+	int ret, data;
+
+	strm_flt(s)->flags &= ~STRM_FLT_FL_HOLD_HTTP_HDRS;
+
+	ret = data = len - out;
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s,
+			s->txn.http, msg);
+	for (filter = flt_list_start(s, msg->chn); filter;
+	     filter = flt_list_next(s, msg->chn, filter)) {
+		struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+		unsigned long long *flt_off = &FLT_OFF(filter, msg->chn);
+		unsigned int offset = *flt_off - *strm_off;
+
+		/* Call http_payload for filters only. Forward all data for
+		 * others and update the filter offset
+		 */
+		if (!IS_DATA_FILTER(filter, msg->chn) || !FLT_OPS(filter)->http_payload) {
+			*flt_off += data - offset;
+			continue;
+		}
+
+		DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+		filter->calls++;
+		ret = EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->http_payload(s, filter, msg, out + offset, data - offset));
+		if (ret < 0) {
+			resume_filter_list_break(s, msg->chn, filter, ret);
+			goto end;
+		}
+		data = ret + *flt_off - *strm_off;
+		*flt_off += ret;
+	}
+
+	/* If nothing was forwarded yet, we take care to hold the headers if
+	 * following conditions are met :
+	 *
+	 *  - *strm_off == 0 (nothing forwarded yet)
+	 *  - ret == 0       (no data forwarded at all on this turn)
+	 *  - STRM_FLT_FL_HOLD_HTTP_HDRS flag set (at least one filter want to hold the headers)
+	 *
+	 * Be careful, STRM_FLT_FL_HOLD_HTTP_HDRS is removed before each http_payload loop.
+	 * Thus, it must explicitly be set when necessary. We must do that to hold the headers
+	 * when there is no payload.
+	 */
+	if (!ret && !*strm_off && (strm_flt(s)->flags & STRM_FLT_FL_HOLD_HTTP_HDRS))
+		goto end;
+
+	ret = data;
+	*strm_off += ret;
+ end:
+	chn_prod(msg->chn)->sedesc->kip = 0;
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+	return ret;
+}
+
+/*
+ * Calls 'channel_start_analyze' callback for all filters attached to a
+ * stream. This function is called when we start to analyze a request or a
+ * response. For frontend filters, it is called before all other analyzers. For
+ * backend ones, it is called before all backend
+ * analyzers. 'channel_start_analyze' callback is resumable, so this function
+ * returns 0 if an error occurs or if it needs to wait, any other value
+ * otherwise.
+ */
+int
+flt_start_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
+{
+	struct filter *filter;
+	int ret = 1;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_FLT_ANA, s);
+
+	/* If this function is called, this means there is at least one filter,
+	 * so we do not need to check the filter list's emptiness. */
+
+	/* Set flag on channel to tell that the channel is filtered */
+	chn->flags |= CF_FLT_ANALYZE;
+	chn->analysers |= ((chn->flags & CF_ISRESP) ? AN_RES_FLT_END : AN_REQ_FLT_END);
+
+	for (filter = resume_filter_list_start(s, chn); filter;
+	     filter = resume_filter_list_next(s, chn, filter)) {
+		if (!(chn->flags & CF_ISRESP)) {
+			if (an_bit == AN_REQ_FLT_START_BE &&
+			    !(filter->flags & FLT_FL_IS_BACKEND_FILTER))
+				continue;
+		}
+		else {
+			if (an_bit == AN_RES_FLT_START_BE &&
+			    !(filter->flags & FLT_FL_IS_BACKEND_FILTER))
+				continue;
+		}
+
+		FLT_OFF(filter, chn) = 0;
+		if (FLT_OPS(filter)->channel_start_analyze) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
+			ret = EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->channel_start_analyze(s, filter, chn));
+			if (ret <= 0) {
+				resume_filter_list_break(s, chn, filter, ret);
+				goto end;
+			}
+		}
+	}
+
+ end:
+	ret = handle_analyzer_result(s, chn, an_bit, ret);
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_FLT_ANA, s);
+	return ret;
+}
+
+/*
+ * Calls 'channel_pre_analyze' callback for all filters attached to a
+ * stream. This function is called BEFORE each analyzer attached to a channel,
+ * expects analyzers responsible for data sending. 'channel_pre_analyze'
+ * callback is resumable, so this function returns 0 if an error occurs or if it
+ * needs to wait, any other value otherwise.
+ *
+ * Note this function can be called many times for the same analyzer. In fact,
+ * it is called until the analyzer finishes its processing.
+ */
+int
+flt_pre_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
+{
+	struct filter *filter;
+	int ret = 1;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_FLT_ANA, s);
+
+	for (filter = resume_filter_list_start(s, chn); filter;
+	     filter = resume_filter_list_next(s, chn, filter)) {
+		if (FLT_OPS(filter)->channel_pre_analyze && (filter->pre_analyzers & an_bit)) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
+			ret = EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->channel_pre_analyze(s, filter, chn, an_bit));
+			if (ret <= 0) {
+				resume_filter_list_break(s, chn, filter, ret);
+				goto check_result;
+			}
+			filter->pre_analyzers &= ~an_bit;
+		}
+	}
+
+ check_result:
+	ret = handle_analyzer_result(s, chn, 0, ret);
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_FLT_ANA, s);
+	return ret;
+}
+
+/*
+ * Calls 'channel_post_analyze' callback for all filters attached to a
+ * stream. This function is called AFTER each analyzer attached to a channel,
+ * expects analyzers responsible for data sending. 'channel_post_analyze'
+ * callback is NOT resumable, so this function returns a 0 if an error occurs,
+ * any other value otherwise.
+ *
+ * Here, AFTER means when the analyzer finishes its processing.
+ */
+int
+flt_post_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
+{
+	struct filter *filter;
+	int            ret = 1;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_FLT_ANA, s);
+
+	for (filter = flt_list_start(s, chn); filter;
+	     filter = flt_list_next(s, chn, filter)) {
+		if (FLT_OPS(filter)->channel_post_analyze &&  (filter->post_analyzers & an_bit)) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
+			ret = EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->channel_post_analyze(s, filter, chn, an_bit));
+			if (ret < 0) {
+				resume_filter_list_break(s, chn, filter, ret);
+				break;
+			}
+			filter->post_analyzers &= ~an_bit;
+		}
+	}
+	ret = handle_analyzer_result(s, chn, 0, ret);
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_FLT_ANA, s);
+	return ret;
+}
+
+/*
+ * This function is the AN_REQ/RES_FLT_HTTP_HDRS analyzer, used to filter HTTP
+ * headers or a request or a response. Returns 0 if an error occurs or if it
+ * needs to wait, any other value otherwise.
+ */
+int
+flt_analyze_http_headers(struct stream *s, struct channel *chn, unsigned int an_bit)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	int              ret = 1;
+
+	msg = ((chn->flags & CF_ISRESP) ? &s->txn.http->rsp : &s->txn.http->req);
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s,
+			s->txn.http, msg);
+
+	for (filter = resume_filter_list_start(s, chn); filter;
+	     filter = resume_filter_list_next(s, chn, filter)) {
+		if (FLT_OPS(filter)->http_headers) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
+			ret = EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->http_headers(s, filter, msg));
+			if (ret <= 0) {
+				resume_filter_list_break(s, chn, filter, ret);
+				goto check_result;
+			}
+		}
+	}
+
+	if (HAS_DATA_FILTERS(s, chn)) {
+		size_t data = http_get_hdrs_size(htxbuf(&chn->buf));
+		struct filter *f;
+
+		for (f = flt_list_start(s, chn); f;
+		     f = flt_list_next(s, chn, f))
+			FLT_OFF(f, chn) = data;
+	}
+
+ check_result:
+	ret = handle_analyzer_result(s, chn, an_bit, ret);
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+	return ret;
+}
+
+/*
+ * Calls 'channel_end_analyze' callback for all filters attached to a
+ * stream. This function is called when we stop to analyze a request or a
+ * response. It is called after all other analyzers. 'channel_end_analyze'
+ * callback is resumable, so this function returns 0 if an error occurs or if it
+ * needs to wait, any other value otherwise.
+ */
+int
+flt_end_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
+{
+	int ret = 1;
+	struct filter *filter;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_FLT_ANA, s);
+
+	/* Check if all filters attached on the stream have finished their
+	 * processing on this channel. */
+	if (!(chn->flags & CF_FLT_ANALYZE))
+		goto sync;
+
+	for (filter = resume_filter_list_start(s, chn); filter;
+	     filter = resume_filter_list_next(s, chn, filter)) {
+		FLT_OFF(filter, chn) = 0;
+		unregister_data_filter(s, chn, filter);
+
+		if (FLT_OPS(filter)->channel_end_analyze) {
+			struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+
+			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
+			ret = EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->channel_end_analyze(s, filter, chn));
+			if (ret <= 0) {
+				resume_filter_list_break(s, chn, filter, ret);
+				goto end;
+			}
+		}
+	}
+
+ end:
+	/* We don't remove yet this analyzer because we need to synchronize the
+	 * both channels. So here, we just remove the flag CF_FLT_ANALYZE. */
+	ret = handle_analyzer_result(s, chn, 0, ret);
+	if (ret) {
+		chn->flags &= ~CF_FLT_ANALYZE;
+
+		/* Pretend there is an activity on both channels. Flag on the
+		 * current one will be automatically removed, so only the other
+		 * one will remain. This is a way to be sure that
+		 * 'channel_end_analyze' callback will have a chance to be
+		 * called at least once for the other side to finish the current
+		 * processing. Of course, this is the filter responsibility to
+		 * wakeup the stream if it choose to loop on this callback. */
+		s->req.flags |= CF_WAKE_ONCE;
+		s->res.flags |= CF_WAKE_ONCE;
+	}
+
+
+ sync:
+	/* Now we can check if filters have finished their work on the both
+	 * channels */
+	if (!(s->req.flags & CF_FLT_ANALYZE) && !(s->res.flags & CF_FLT_ANALYZE)) {
+		/* Sync channels by removing this analyzer for the both channels */
+		s->req.analysers &= ~AN_REQ_FLT_END;
+		s->res.analysers &= ~AN_RES_FLT_END;
+
+		/* Remove backend filters from the list */
+		flt_stream_release(s, 1);
+		DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_FLT_ANA, s);
+	}
+	else {
+		DBG_TRACE_DEVEL("waiting for sync", STRM_EV_STRM_ANA|STRM_EV_FLT_ANA, s);
+	}
+	return ret;
+}
+
+
+/*
+ * Calls 'tcp_payload' callback for all "data" filters attached to a
+ * stream. This function is called when some data can be forwarded in the
+ * AN_REQ_FLT_XFER_BODY and AN_RES_FLT_XFER_BODY analyzers. It takes care to
+ * update the filters and the stream offset to be sure that a filter cannot
+ * forward more data than its predecessors. A filter can choose to not forward
+ * all data. Returns a negative value if an error occurs, else the number of
+ * forwarded bytes.
+ */
+int
+flt_tcp_payload(struct stream *s, struct channel *chn, unsigned int len)
+{
+	struct filter *filter;
+	unsigned long long *strm_off = &FLT_STRM_OFF(s, chn);
+	unsigned int out = co_data(chn);
+	int ret, data;
+
+	ret = data = len - out;
+	DBG_TRACE_ENTER(STRM_EV_TCP_ANA|STRM_EV_FLT_ANA, s);
+	for (filter = flt_list_start(s, chn); filter;
+	     filter = flt_list_next(s, chn, filter)) {
+		struct thread_exec_ctx exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FLT, filter->config);
+		unsigned long long *flt_off = &FLT_OFF(filter, chn);
+		unsigned int offset = *flt_off - *strm_off;
+
+		/* Call tcp_payload for filters only. Forward all data for
+		 * others and update the filter offset
+		 */
+		if (!IS_DATA_FILTER(filter, chn) || !FLT_OPS(filter)->tcp_payload) {
+			*flt_off += data - offset;
+			continue;
+		}
+
+		DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_TCP_ANA|STRM_EV_FLT_ANA, s);
+		filter->calls++;
+		ret = EXEC_CTX_WITH_RET(exec_ctx, FLT_OPS(filter)->tcp_payload(s, filter, chn, out + offset, data - offset));
+		if (ret < 0) {
+			resume_filter_list_break(s, chn, filter, ret);
+			goto end;
+		}
+		data = ret + *flt_off - *strm_off;
+		*flt_off += ret;
+	}
+
+	/* Only forward data if the last filter decides to forward something */
+	if (ret > 0) {
+		ret = data;
+		*strm_off += ret;
+	}
+ end:
+	chn_prod(chn)->sedesc->kip = 0;
+	DBG_TRACE_LEAVE(STRM_EV_TCP_ANA|STRM_EV_FLT_ANA, s);
+	return ret;
+}
+
+/*
+ * Called when TCP data must be filtered on a channel. This function is the
+ * AN_REQ/RES_FLT_XFER_DATA analyzer. When called, it is responsible to forward
+ * data when the proxy is not in http mode. Behind the scene, it calls
+ * consecutively 'tcp_data' and 'tcp_forward_data' callbacks for all "data"
+ * filters attached to a stream. Returns 0 if an error occurs or if it needs to
+ * wait, any other value otherwise.
+ */
+int
+flt_xfer_data(struct stream *s, struct channel *chn, unsigned int an_bit)
+{
+	unsigned int len;
+	int ret = 1;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_TCP_ANA|STRM_EV_FLT_ANA, s);
+
+	/* If there is no "data" filters, we do nothing */
+	if (!HAS_DATA_FILTERS(s, chn))
+		goto end;
+
+	if (s->flags & SF_HTX) {
+		struct htx *htx = htxbuf(&chn->buf);
+		len = htx->data;
+	}
+	else
+		len = c_data(chn);
+
+	ret = flt_tcp_payload(s, chn, len);
+	if (ret < 0)
+		goto end;
+	c_adv(chn, ret);
+
+	/* Stop waiting data if:
+	 *  - it the output is closed
+	 *  - the input in closed and no data is pending
+	 *  - There is a READ/WRITE timeout
+	 */
+	if (chn_cons(chn)->flags & SC_FL_SHUT_DONE) {
+		ret = 1;
+		goto end;
+	}
+	if (chn_prod(chn)->flags & (SC_FL_ABRT_DONE|SC_FL_EOS)) {
+		if (((s->flags & SF_HTX) && htx_is_empty(htxbuf(&chn->buf))) || c_empty(chn)) {
+			ret = 1;
+			goto end;
+		}
+	}
+	if (chn->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT)) {
+		ret = 1;
+		goto end;
+	}
+
+	/* Wait for data */
+	DBG_TRACE_DEVEL("waiting for more data", STRM_EV_STRM_ANA|STRM_EV_TCP_ANA|STRM_EV_FLT_ANA, s);
+
+	/* DATA filtering is not finished and some data may still be blocked in
+	 * the channel. So take care to disable auto close
+	 */
+	if (HAS_DATA_FILTERS(s, chn))
+		channel_dont_close(chn);
+
+	return 0;
+
+ end:
+	/* Terminate the data filtering. If <ret> is negative, an error was
+	 * encountered during the filtering. */
+	ret = handle_analyzer_result(s, chn, an_bit, ret);
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_TCP_ANA|STRM_EV_FLT_ANA, s);
+	return ret;
+}
+
+/*
+ * Handles result of filter's analyzers. It returns 0 if an error occurs or if
+ * it needs to wait, any other value otherwise.
+ */
+static int
+handle_analyzer_result(struct stream *s, struct channel *chn,
+		       unsigned int an_bit, int ret)
+{
+	if (ret < 0)
+		goto return_bad_req;
+	else if (!ret)
+		goto wait;
+
+	/* End of job, return OK */
+	if (an_bit) {
+		chn->analysers  &= ~an_bit;
+		chn->analyse_exp = TICK_ETERNITY;
+	}
+	return 1;
+
+ return_bad_req:
+	/* An error occurs */
+	if (IS_HTX_STRM(s)) {
+		http_set_term_flags(s);
+
+		if (s->txn.http->status > 0)
+			http_reply_and_close(s, s->txn.http->status, NULL);
+		else {
+			s->txn.http->status = (!(chn->flags & CF_ISRESP)) ? 400 : 502;
+			http_reply_and_close(s, s->txn.http->status,
+					     http_error_message(s));
+		}
+	}
+	else {
+		sess_set_term_flags(s);
+		stream_retnclose(s, NULL);
+	}
+
+	if (!(chn->flags & CF_ISRESP))
+		s->req.analysers &= AN_REQ_FLT_END;
+	else
+		s->res.analysers &= AN_RES_FLT_END;
+
+
+	DBG_TRACE_DEVEL("leaving on error", STRM_EV_FLT_ANA|STRM_EV_FLT_ERR, s);
+	return 0;
+
+ wait:
+	if (!(chn->flags & CF_ISRESP))
+		channel_dont_connect(chn);
+	channel_dont_close(chn);
+	DBG_TRACE_DEVEL("wairing for more data", STRM_EV_FLT_ANA, s);
+	return 0;
+}
+
+/* Iterates over the instances of the list <instances> for side <side>,
+ * recursively in evaluation order. <fct> must return 0 to continue, any other
+ * value to stop immediately; that value is then returned.
+ *
+ * Note: it must only be used on loop-free structures. Sequence application
+ * checks each move and rolls it back before reporting a loop.
+ */
+static int flt_foreach_instance(struct list *instances, unsigned int side,
+			   int (*fct)(struct filter_instance *inst, void *data), void *data)
+{
+	struct filter_instance *inst;
+	struct filter_inst_side *ds;
+	struct list *entry;
+	int ret;
+
+	for (entry = instances->n; entry != instances; entry = entry->n) {
+		inst = flt_inst_from_list(entry, side);
+		ds = flt_inst_side(inst, side);
+		ret = flt_foreach_instance(&ds->reordered_before, side, fct, data);
+		if (ret)
+			return ret;
+		ret = fct(inst, data);
+		if (ret)
+			return ret;
+		ret = flt_foreach_instance(&ds->reordered_after, side, fct, data);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/* Iterates over all the instances of the proxy <px> for side <side>,
+ * recursively.
+ */
+static int flt_foreach_instance_side(struct proxy *px, unsigned int side,
+				int (*fct)(struct filter_instance *inst, void *data), void *data)
+{
+	struct list *refs = flt_class_refs(px, side);
+	struct filter_class_ref *ref;
+	int ret;
+
+	list_for_each_entry(ref, refs, list) {
+		ret = flt_foreach_instance(&ref->reordered_before, side, fct, data);
+		if (ret)
+			return ret;
+		ret = flt_foreach_instance(&ref->instances, side, fct, data);
+		if (ret)
+			return ret;
+		ret = flt_foreach_instance(&ref->reordered_after, side, fct, data);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/* Finds the class reference of the class <cls> in the proxy <px> for side
+ * <side>.
+ * Returns the class reference, or NULL if not found for the given side.
+ */
+static struct filter_class_ref *flt_get_class_ref(struct proxy *px, struct filter_class *cls,
+						  unsigned int side)
+{
+	struct list *refs = flt_class_refs(px, side);
+	struct filter_class_ref *ref;
+
+	list_for_each_entry(ref, refs, list) {
+		if (ref->class == cls)
+			return ref;
+	}
+	return NULL;
+}
+
+/* Context for flt_match_instance_cb() */
+struct flt_match_instance_ctx {
+	struct filter_class *cls;   /* the class to match */
+	const char *id;             /* the id to match, NULL for any id */
+	struct filter_instance *found; /* the first matching instance, if any */
+	int count;                  /* the number of matching instances */
+};
+
+/* Callback matching the instances of the class ctx->cls with the id
+ * ctx->id (any id if NULL). The first match is recorded in ctx->found and
+ * the matches are counted in ctx->count (a instance of a class placed on
+ * both sides is counted once). With an id, the iteration stops at the
+ * first match.
+ */
+static int flt_match_instance_cb(struct filter_instance *inst, void *data)
+{
+	struct flt_match_instance_ctx *ctx = data;
+
+	if (inst->class != ctx->cls)
+		return 0;
+	if (ctx->id && (!inst->id || strcmp(inst->id, ctx->id) != 0))
+		return 0;
+	if (!ctx->found)
+		ctx->found = inst;
+	ctx->count++;
+	return ctx->id ? 1 : 0;
+}
+
+/* Context for flt_enable_cb() */
+struct flt_enable_ctx {
+	struct filter_class *cls;   /* the class to match */
+	const char *id;             /* the id to match, NULL for any id */
+	unsigned int enable;        /* the value to set inst->enabled to */
+	int found;                  /* the number of matching instances */
+};
+
+/* Callback enabling/disabling the matching instances with ctx->enable. */
+static int flt_enable_cb(struct filter_instance *inst, void *data)
+{
+	struct flt_enable_ctx *ctx = data;
+
+	if (inst->class != ctx->cls)
+		return 0;
+	if (ctx->id && (!inst->id || strcmp(inst->id, ctx->id) != 0))
+		return 0;
+	inst->enabled = ctx->enable;
+	ctx->found++;
+	return 0;
+}
+
+/* Finds the filter instance of the class <cls> with the id <id> in the proxy
+ * <px>. If <id> is NULL, the first instance of the class is returned.  The
+ * number of matching instances is returned in <*count> if not NULL.
+ * Returns NULL if not found.
+ */
+static struct filter_instance *flt_find_instance_count(struct proxy *px, struct filter_class *cls,
+						   const char *id, int *count)
+{
+	struct flt_match_instance_ctx ctx = { .cls = cls, .id = id, .found = NULL, .count = 0 };
+
+	/* The global order contains every instance exactly once, whether it
+	 * is still in class references (including defaults) or already flat.
+	 */
+	if (flt_foreach_instance(&px->filter_instances, FLT_SIDE_GLOBAL, flt_match_instance_cb, &ctx) && ctx.found)
+		goto end;
+	flt_foreach_instance_side(px, FLT_SIDE_GLOBAL, flt_match_instance_cb, &ctx);
+
+  end:
+	if (count)
+		*count = ctx.count;
+	return ctx.found;
+}
+
+/* Finds the filter instance of the class <cls> with the id <id> in the proxy
+ * <px>. If <id> is NULL, the first instance of the class is returned.
+ * Returns NULL if not found.
+ */
+struct filter_instance *flt_find_instance(struct proxy *px, struct filter_class *cls, const char *id)
+{
+	return flt_find_instance_count(px, cls, id, NULL);
+}
+
+/* Calls <fct> for each filter configuration of the proxy <px> in the evaluation
+ * order of side <side> (FLT_SIDE_GLOBAL, FLT_SIDE_REQ or FLT_SIDE_RES). In
+ * legacy mode (PR_FL_FILTER_LEGACY), the matching filter_configs,
+ * filters_req_configs or filters_res_configs list is used.
+ * <fct> must return 0 to continue, any other value to stop immediately; that
+ * value is then returned.
+ */
+int flt_foreach_conf(struct proxy *px, unsigned int side,
+		     int (*fct)(struct flt_conf *fconf, void *data), void *data)
+{
+	struct filter_instance *inst;
+	struct flt_conf *fconf;
+	int ret = 0;
+
+	if (flt_use_legacy_filter(px)) {
+		if (side == FLT_SIDE_REQ) {
+			list_for_each_entry(fconf, &px->filters_req_configs, by_req) {
+				ret = fct(fconf, data);
+				if (ret)
+					break;
+			}
+			return ret;
+		}
+		if (side == FLT_SIDE_RES) {
+			list_for_each_entry(fconf, &px->filters_res_configs, by_res) {
+				ret = fct(fconf, data);
+				if (ret)
+					break;
+			}
+			return ret;
+		}
+		list_for_each_entry(fconf, &px->filter_configs, list) {
+			ret = fct(fconf, data);
+			if (ret)
+				break;
+		}
+		return ret;
+	}
+
+	if (side == FLT_SIDE_GLOBAL) {
+		list_for_each_entry(inst, &px->filter_instances, global.list) {
+			if (!inst->fconf)
+				continue;
+			ret = fct(inst->fconf, data);
+			if (ret)
+				break;
+		}
+	}
+	else if (side == FLT_SIDE_REQ) {
+		list_for_each_entry(inst, &px->filter_req_instances, req.list) {
+			if (!inst->fconf)
+				continue;
+			ret = fct(inst->fconf, data);
+			if (ret)
+				break;
+		}
+	}
+	else {
+		list_for_each_entry(inst, &px->filter_res_instances, res.list) {
+			if (!inst->fconf)
+				continue;
+			ret = fct(inst->fconf, data);
+			if (ret)
+				break;
+		}
+	}
+	return ret;
+}
+
+/* Context for flt_find_conf_cb() */
+struct flt_find_conf_ctx {
+	const char *flt_id;                          /* the filter id to match, NULL for any id */
+	int (*match)(struct flt_conf *fconf, void *data); /* optional extra match */
+	void *data;                                  /* data for the match callback */
+	struct flt_conf *found;                      /* the first matching configuration */
+};
+
+/* Callback matching the filter configurations with the id ctx->flt_id (any
+ * id if NULL) and the ctx->match callback if set. The first match is
+ * recorded in ctx->found and the iteration stops.
+ */
+static int flt_find_conf_cb(struct flt_conf *fconf, void *data)
+{
+	struct flt_find_conf_ctx *ctx = data;
+
+	if (ctx->flt_id && fconf->id != ctx->flt_id)
+		return 0;
+	if (ctx->match && !ctx->match(fconf, ctx->data))
+		return 0;
+	ctx->found = fconf;
+	return 1;
+}
+
+/* Finds a filter configuration of the proxy <px> with the id <flt_id> (any
+ * id if NULL), from the filter instances by default or from the legacy
+ * filters if the proxy is in legacy mode (see flt_foreach_conf()). If
+ * <match> is not NULL, it is called with each candidate and <data> and must
+ * return non-zero to accept it. Returns the first match, or NULL if none.
+ */
+struct flt_conf *flt_find_conf(struct proxy *px, const char *flt_id, unsigned int side,
+			       int (*match)(struct flt_conf *fconf, void *data), void *data)
+{
+	struct flt_find_conf_ctx ctx = { .flt_id = flt_id, .match = match, .data = data, .found = NULL };
+
+	flt_foreach_conf(px, side, flt_find_conf_cb, &ctx);
+	return ctx.found;
+}
+
+/* Finds a legacy filter configuration of the proxy <px> with the id
+ * <flt_id> (any id if NULL), searching the legacy configurations in
+ * declaration order, whatever the filter mode of the proxy. Unlike
+ * flt_find_conf(), it never resolves the configurations of the filter
+ * instances, so it must only be used during the configuration parsing,
+ * before the mode of the proxy is deduced: after the post-parsing stage,
+ * the legacy configurations of the filters that registered no class are
+ * ignored in the new mode. If <match> is not NULL, it is called with each
+ * candidate and <data> and must return non-zero to accept it. Returns the
+ * first match, or NULL if none.
+ */
+struct flt_conf *flt_find_legacy_conf(struct proxy *px, const char *flt_id,
+				      int (*match)(struct flt_conf *fconf, void *data), void *data)
+{
+	struct flt_conf *fconf;
+
+	list_for_each_entry(fconf, &px->filter_configs, list) {
+		if (flt_id && fconf->id != flt_id)
+			continue;
+		if (match && !match(fconf, data))
+			continue;
+		return fconf;
+	}
+	return NULL;
+}
+
+
+/* Links <inst> in the global class references of <px> and on each side its
+ * class is placed on. All links were initialized on allocation.
+ * Returns 0 on success, -1 if a required class reference is missing or the
+ * class is not placed on any side.
+ */
+static int flt_init_instance(struct filter_instance *inst, struct proxy *px)
+{
+	struct filter_class_ref *ref;
+	int linked = 0;
+
+	inst->px = px;
+	ref = flt_get_class_ref(px, inst->class, FLT_SIDE_GLOBAL);
+	if (!ref)
+		return -1;
+	LIST_APPEND(&ref->instances, &inst->global.list);
+
+	if (LIST_INLIST(&inst->class->req.list)) {
+		ref = flt_get_class_ref(px, inst->class, FLT_SIDE_REQ);
+		if (!ref)
+			return -1;
+		LIST_APPEND(&ref->instances, &inst->req.list);
+		linked = 1;
+	}
+	if (LIST_INLIST(&inst->class->res.list)) {
+		ref = flt_get_class_ref(px, inst->class, FLT_SIDE_RES);
+		if (!ref)
+			return -1;
+		LIST_APPEND(&ref->instances, &inst->res.list);
+		linked = 1;
+	}
+	return linked ? 0 : -1;
+}
+
+/* Frees all filter instances of the proxy <px>, its filter class
+ * references, its filter-enable entries and its filter sequences.
+ */
+void flt_free_instances(struct proxy *px)
+{
+	struct filter_class_ref *ref, *refback;
+	struct filter_enabled *flt_en, *enback;
+	struct filter_sequence *seq, *seqback;
+
+	flt_free_inst_list(&px->filter_req_instances, FLT_SIDE_REQ);
+	flt_free_inst_list(&px->filter_res_instances, FLT_SIDE_RES);
+	list_for_each_entry_safe(ref, refback, &px->conf.filter_req_refs, list) {
+		flt_free_inst_list(&ref->instances, FLT_SIDE_REQ);
+		flt_free_inst_list(&ref->reordered_before, FLT_SIDE_REQ);
+		flt_free_inst_list(&ref->reordered_after, FLT_SIDE_REQ);
+		LIST_DELETE(&ref->list);
+		free(ref);
+	}
+	list_for_each_entry_safe(ref, refback, &px->conf.filter_res_refs, list) {
+		flt_free_inst_list(&ref->instances, FLT_SIDE_RES);
+		flt_free_inst_list(&ref->reordered_before, FLT_SIDE_RES);
+		flt_free_inst_list(&ref->reordered_after, FLT_SIDE_RES);
+		LIST_DELETE(&ref->list);
+		free(ref);
+	}
+	flt_free_inst_list(&px->filter_instances, FLT_SIDE_GLOBAL);
+	list_for_each_entry_safe(ref, refback, &px->conf.filter_refs, list) {
+		flt_free_inst_list(&ref->instances, FLT_SIDE_GLOBAL);
+		flt_free_inst_list(&ref->reordered_before, FLT_SIDE_GLOBAL);
+		flt_free_inst_list(&ref->reordered_after, FLT_SIDE_GLOBAL);
+		LIST_DELETE(&ref->list);
+		free(ref);
+	}
+	list_for_each_entry_safe(flt_en, enback, &px->conf.filter_enabled, list)
+		flt_free_enabled(flt_en);
+
+	list_for_each_entry_safe(seq, seqback, &px->conf.filter_sequences, list)
+		flt_free_sequence(seq);
+}
+
+/* Deep-copies the filter instances of the defaults proxy <defpx> into the
+ * proxy <px>, so that proxies inherit the filter instances of their
+ * defaults section. It must be called before any instance is added to <px>,
+ * so that locally defined ones can replace the inherited ones.
+ * Returns 0 on success, -1 on error.
+ */
+static int flt_copy_instance(struct proxy *px, const struct filter_instance *inst)
+{
+	struct filter_instance *new_inst;
+	int i;
+
+	new_inst = flt_alloc_instance();
+	if (!new_inst)
+		return -1;
+
+	new_inst->class   = inst->class;
+	new_inst->enabled = inst->enabled;
+	new_inst->flags   = inst->flags | FLT_INST_F_INHERITED;
+
+	if (inst->id) {
+		new_inst->id = strdup(inst->id);
+		if (!new_inst->id)
+			goto error;
+	}
+	new_inst->conf.file = strdup(inst->conf.file);
+	if (!new_inst->conf.file)
+		goto error;
+	new_inst->conf.line = inst->conf.line;
+	new_inst->conf.argc = inst->conf.argc;
+	new_inst->conf.argv = calloc(inst->conf.argc + 1, sizeof(*new_inst->conf.argv));
+	if (!new_inst->conf.argv)
+		goto error;
+	for (i = 0; i < inst->conf.argc; i++) {
+		new_inst->conf.argv[i] = strdup(inst->conf.argv[i]);
+		if (!new_inst->conf.argv[i])
+			goto error;
+	}
+
+	if (flt_init_instance(new_inst, px) < 0)
+		goto error;
+	return 0;
+
+  error:
+	flt_free_instance(new_inst);
+	return -1;
+}
+
+/* Copy all filter instances of the defaults proxy <defpx> into the proxy <px>.
+ * Returns 0 on success, -1 on error (out of memory).
+ */
+int flt_copy_instances(struct proxy *px, const struct proxy *defpx)
+{
+	struct filter_class_ref *ref;
+	struct filter_instance *inst;
+	struct filter_enabled *flt_en, *new_en;
+	struct filter_sequence *seq, *new_seq;
+
+	/* Defaults keep their class references until destruction. Copy every
+	 * instance once, in the global class order.
+	 */
+	list_for_each_entry(ref, &defpx->conf.filter_refs, list) {
+		list_for_each_entry(inst, &ref->instances, global.list)
+			if (flt_copy_instance(px, inst) < 0)
+				goto error;
+	}
+
+	/* inherit the filter-enable entries too */
+	list_for_each_entry(flt_en, &defpx->conf.filter_enabled, list) {
+		new_en = calloc(1, sizeof(*new_en));
+		if (!new_en)
+			goto error;
+		LIST_INIT(&new_en->list);
+		new_en->cls_name = strdup(flt_en->cls_name);
+		new_en->id = flt_en->id ? strdup(flt_en->id) : NULL;
+		new_en->enable = flt_en->enable;
+		new_en->file = strdup(flt_en->file);
+		new_en->line = flt_en->line;
+		if (!new_en->cls_name || (flt_en->id && !new_en->id) || !new_en->file) {
+			flt_free_enabled(new_en);
+			goto error;
+		}
+		LIST_APPEND(&px->conf.filter_enabled, &new_en->list);
+	}
+
+	/* inherit the filter sequences too, in configuration order */
+	list_for_each_entry(seq, &defpx->conf.filter_sequences, list) {
+		new_seq = calloc(1, sizeof(*new_seq));
+		if (!new_seq)
+			goto error;
+		LIST_INIT(&new_seq->list);
+		new_seq->cls_name = strdup(seq->cls_name);
+		new_seq->id = seq->id ? strdup(seq->id) : NULL;
+		new_seq->cls_ref_name = strdup(seq->cls_ref_name);
+		new_seq->ref_id = seq->ref_id ? strdup(seq->ref_id) : NULL;
+		new_seq->side = seq->side;
+		new_seq->pos = seq->pos;
+		new_seq->file = strdup(seq->file);
+		new_seq->line = seq->line;
+		if (!new_seq->cls_name || (seq->id && !new_seq->id) ||
+		    !new_seq->cls_ref_name || (seq->ref_id && !new_seq->ref_id) ||
+		    !new_seq->file) {
+			flt_free_sequence(new_seq);
+			goto error;
+		}
+		LIST_APPEND(&px->conf.filter_sequences, &new_seq->list);
+	}
+	return 0;
+
+  error:
+	flt_free_instances(px);
+	return -1;
+}
+
+/* Adds an implicit filter instance for the class <cls> to the proxy <px>,
+ * with the id <id> and the arguments <args> (terminated by an empty
+ * string). It is used when a filter is implicitly configured by another
+ * directive (e.g. with the cache-store action). The instance is marked
+ * with FLT_INST_F_IMPLICIT and is enabled, since the directive implies
+ * the filter usage.
+ *
+ * An id is mandatory when the class supports several instances per proxy:
+ * an id-less instance could not be distinguished from a second one. For
+ * the other classes the id is optional and may be NULL.
+ *
+ * If a instance with the same class and id already exists, nothing is
+ * done: an explicit declaration always wins over an implicit one, and the
+ * first implicit declaration wins. Returns 0 on success, -1 on error (out
+ * of memory).
+ */
+int flt_add_implicit_instance(struct proxy *px, struct filter_class *cls, const char *id,
+				char **args, const char *file, int line)
+{
+	struct filter_instance *inst;
+	int argc = 0;
+	int i;
+
+	if ((cls->flags & FLT_CLS_FL_MULTI) && !id) {
+		ha_warning("config: %s '%s' : implicit filter instance of class '%s' without id ignored, an id is required for this filter class (see %s:%d).\n",
+			   proxy_type_str(px), px->id, cls->name,
+			   file, line);
+		return 0;
+	}
+
+	/* a instance already exists for this class and id: explicit or
+	 * implicit, it wins over a new implicit one.
+	 */
+	if (flt_find_instance(px, cls, id))
+		return 0;
+
+	inst = flt_alloc_instance();
+	if (!inst)
+		return -1;
+
+	inst->class   = cls;
+	inst->enabled = 1; /* the directive implies the filter usage */
+	inst->flags   = FLT_INST_F_IMPLICIT;
+
+	if (id) {
+		inst->id = strdup(id);
+		if (!inst->id)
+			goto error;
+	}
+	inst->conf.file = strdup(file);
+	if (!inst->conf.file)
+		goto error;
+	inst->conf.line = line;
+
+	for (argc = 0; args && *args[argc]; argc++)
+		;
+	inst->conf.argc = argc;
+	inst->conf.argv = calloc(argc + 1, sizeof(*inst->conf.argv));
+	if (!inst->conf.argv)
+		goto error;
+	for (i = 0; i < argc; i++) {
+		inst->conf.argv[i] = strdup(args[i]);
+		if (!inst->conf.argv[i])
+			goto error;
+	}
+
+	if (flt_init_instance(inst, px) < 0)
+		goto error;
+	return 0;
+
+  error:
+	flt_free_instance(inst);
+	return -1;
+}
+
+/*
+ * Parses the "filter-config" keyword. A filter instance is created for the
+ * given filter class and attached to the current proxy. The instance
+ * arguments are only copied here, they will be finalized during the
+ * post-check stage. The syntax is:
+ *
+ *   filter-config <class-name> [ id <id> ] [enabled] args...
+ *
+ * The "id" and "enabled" tokens, if set, must be the first options, in that
+ * order. The id is optional, but it is mandatory for filter classes allowing
+ * several instances per proxy. A instance inherited from a defaults
+ * section or coming from an implicit declaration (e.g. use-fcgi-app) may be
+ * overridden by a instance with the same class and id, but duplicating an
+ * explicit instance inside the same proxy is rejected.
+ */
+static int parse_filter_config(char **args, int section_type, struct proxy *curpx,
+			       const struct proxy *defpx, const char *file, int line, char **err)
+{
+	struct filter_instance *inst, *old_inst;
+	struct filter_class *cls;
+	const char *id = NULL;
+	const char *err2;
+	int enabled = 0;
+	int cur_arg = 1;
+	int i;
+
+	if ((curpx->cap & PR_CAP_DEF) && !*curpx->id) {
+		memprintf(err, "parsing [%s:%d] : '%s' not allowed in anonymous 'defaults' section.",
+			  file, line, args[0]);
+		return -1;
+	}
+
+	if (flt_check_config_mode(curpx, 0, err) < 0)
+		return -1;
+
+	inst = NULL;
+	if (!*args[cur_arg]) {
+		memprintf(err,
+			  "parsing [%s:%d] : missing argument for '%s' in %s '%s'.",
+			  file, line, args[0], proxy_type_str(curpx), curpx->id);
+		goto error;
+	}
+
+	cls = filter_find_class(args[cur_arg]);
+	if (!cls) {
+		memprintf(err,
+			  "parsing [%s:%d] : '%s' : unknown filter class '%s'.",
+			  file, line, args[0], args[cur_arg]);
+		goto error;
+	}
+	cur_arg++;
+
+	/* optional "id <id>" and "enabled" tokens, in that order */
+	if (strcmp(args[cur_arg], "id") == 0) {
+		if (!*args[cur_arg+1]) {
+			memprintf(err,
+				  "parsing [%s:%d] : '%s %s' : missing filter instance id.",
+				  file, line, args[0], args[1]);
+			goto error;
+		}
+		id = args[cur_arg+1];
+		err2 = invalid_prefix_char(id);
+		if (err2) {
+			memprintf(err,
+				  "parsing [%s:%d] : '%s %s' : invalid character '%c' in filter instance id '%s'.",
+				  file, line, args[0], args[1], *err2, id);
+			goto error;
+		}
+		cur_arg += 2;
+	}
+	if (strcmp(args[cur_arg], "enabled") == 0) {
+		enabled = 1;
+		cur_arg++;
+	}
+
+	if ((cls->flags & FLT_CLS_FL_MULTI) && !id) {
+		memprintf(err,
+			  "parsing [%s:%d] : '%s %s' : missing filter instance id, several instances are allowed for this filter class.",
+			  file, line, args[0], args[1]);
+		goto error;
+	}
+
+	inst = flt_alloc_instance();
+	if (!inst)
+		goto oom;
+
+	inst->class   = cls;
+	inst->px      = curpx;
+	inst->enabled = enabled;
+	inst->flags   = 0; /* explicit declaration */
+
+	if (id) {
+		inst->id = strdup(id);
+		if (!inst->id)
+			goto oom;
+	}
+	inst->conf.file = strdup(file);
+	if (!inst->conf.file)
+		goto oom;
+	inst->conf.line = line;
+
+	/* copy the instance arguments, they will be finalized later */
+	for (i = cur_arg; *args[i]; i++);
+
+	inst->conf.argc = i - cur_arg;
+	inst->conf.argv = calloc(inst->conf.argc + 1, sizeof(*inst->conf.argv));
+	if (!inst->conf.argv)
+		goto oom;
+	for (i = 0; i < inst->conf.argc; i++) {
+		inst->conf.argv[i] = strdup(args[cur_arg + i]);
+		if (!inst->conf.argv[i])
+			goto oom;
+	}
+
+	/* A instance inherited from a defaults section or coming from an
+	 * implicit declaration is overridden by the new one (last wins). But
+	 * an explicit instance declared in this same proxy cannot be
+	 * duplicated.
+	 */
+	old_inst = flt_find_instance(curpx, cls, id);
+	if (old_inst) {
+		if (!(old_inst->flags & (FLT_INST_F_INHERITED|FLT_INST_F_IMPLICIT))) {
+			memprintf(err,
+				  "'%s %s%s%s%s' : duplicate filter instance, already declared at %s:%d.",
+				  args[0], args[1],
+				  id ? " id " : "", id ? id : "", enabled ? " enabled" : "",
+				  old_inst->conf.file, old_inst->conf.line);
+			goto error;
+		}
+		flt_free_instance(old_inst);
+	}
+
+	if (flt_init_instance(inst, curpx) < 0) {
+		memprintf(err,
+			  "parsing [%s:%d] : '%s %s' : filter class reference not found in %s '%s'.",
+			  file, line, args[0], args[1], proxy_type_str(curpx), curpx->id);
+		goto error;
+	}
+	return 0;
+
+  error:
+	if (inst)
+		flt_free_instance(inst);
+	return -1;
+
+  oom:
+	memprintf(err, "parsing [%s:%d] : '%s' : out of memory", file, line, args[0]);
+	goto error;
+}
+
+
+/* Parses one "filter-enable"/"filter-disable" entry "<class>[/<id>]" and
+ * records it in the proxy <curpx>. <enable> is != 0 for "filter-enable" and
+ * 0 for "filter-disable".
+ * Returns 0 on success, -1 on error.
+ */
+static int parse_filter_enable_entry(const char *entry, unsigned int enable, struct proxy *curpx,
+				     const char *file, int line, char **err)
+{
+	struct filter_enabled *flt_en;
+	const char *sep;
+	const char *err2;
+	size_t len;
+
+	sep = strchr(entry, '/');
+	len = sep ? (size_t)(sep - entry) : strlen(entry);
+	if (!len || (sep && !*(sep + 1))) {
+		memprintf(err,
+			  "parsing [%s:%d] : 'filter-%s' : invalid entry '%s'. The syntax is: filter-%s <class>[/<id>] [<class>[/<id>] ...].",
+			  file, line, enable ? "enable" : "disable", entry,
+			  enable ? "enable" : "disable");
+		return -1;
+	}
+
+	flt_en = calloc(1, sizeof(*flt_en));
+	if (!flt_en) {
+		memprintf(err, "'filter-%s' : out of memory", enable ? "enable" : "disable");
+		return -1;
+	}
+
+	LIST_INIT(&flt_en->list);
+	flt_en->cls_name = my_strndup(entry, len);
+	flt_en->id = sep ? strdup(sep + 1) : NULL;
+	flt_en->enable = enable;
+	flt_en->file = strdup(file);
+	flt_en->line = line;
+	if (!flt_en->cls_name || (sep && !flt_en->id) || !flt_en->file) {
+		memprintf(err, "'filter-%s' : out of memory", enable ? "enable" : "disable");
+		goto error;
+	}
+
+	if (!filter_find_class(flt_en->cls_name)) {
+		memprintf(err,
+			  "parsing [%s:%d] : 'filter-%s' : unknown filter class '%s'.",
+			  file, line, enable ? "enable" : "disable", flt_en->cls_name);
+		goto error;
+	}
+	if (flt_en->id) {
+		err2 = invalid_prefix_char(flt_en->id);
+		if (err2) {
+			memprintf(err,
+				  "parsing [%s:%d] : 'filter-%s' : invalid character '%c' in filter instance id '%s'.",
+				  file, line, enable ? "enable" : "disable", *err2, flt_en->id);
+			goto error;
+		}
+	}
+
+	LIST_APPEND(&curpx->conf.filter_enabled, &flt_en->list);
+	return 0;
+
+  error:
+	flt_free_enabled(flt_en);
+	return -1;
+}
+
+/*
+ * Parses the "filter-enable" and "filter-disable" keywords. The syntax is:
+ *
+ *   filter-enable <class>[/<id>] [<class>[/<id>] ...]
+ *   filter-disable <class>[/<id>] [<class>[/<id>] ...]
+ *
+ * The directive is only recorded here, the corresponding filter instances
+ * are enabled/disabled during the post-parsing stage (see
+ * flt_enable_filters()), so the directive order does not matter. Without id,
+ * all the instances of the class are concerned.
+ */
+static int parse_filter_enable(char **args, int section_type, struct proxy *curpx,
+			       const struct proxy *defpx, const char *file, int line, char **err)
+{
+	unsigned int enable = (strcmp(args[0], "filter-enable") == 0);
+	int cur_arg;
+
+	if ((curpx->cap & PR_CAP_DEF) && !*curpx->id) {
+		memprintf(err, "parsing [%s:%d] : '%s' not allowed in anonymous 'defaults' section.",
+			  file, line, args[0]);
+		return -1;
+	}
+
+	if (!*args[1]) {
+		memprintf(err,
+			  "parsing [%s:%d] : missing argument for '%s' in %s '%s'.",
+			  file, line, args[0], proxy_type_str(curpx), curpx->id);
+		return -1;
+	}
+
+	if (flt_check_config_mode(curpx, 0, err) < 0)
+		return -1;
+
+	for (cur_arg = 1; *args[cur_arg]; cur_arg++) {
+		if (parse_filter_enable_entry(args[cur_arg], enable, curpx, file, line, err) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+/* Splits the entity reference <str>, in the form "class[/id]": the class
+ * name and the id (NULL if not set) are returned in newly allocated strings
+ * in <*cls_name> and <*id>. Returns 0 on success, -1 on error.
+ */
+static int flt_parse_entity(const char *str, const char **cls_name, const char **id, char **err)
+{
+	const char *sep;
+	const char *err2;
+	size_t len;
+
+	sep = strchr(str, '/');
+	len = sep ? (size_t)(sep - str) : strlen(str);
+	if (!len || (sep && !*(sep + 1))) {
+		memprintf(err, "invalid entity '%s', expecting <class>[/<id>]", str);
+		return -1;
+	}
+
+	*cls_name = my_strndup(str, len);
+	*id = sep ? strdup(sep + 1) : NULL;
+	if (!*cls_name || (sep && !*id)) {
+		memprintf(err, "out of memory");
+		goto error;
+	}
+
+	if (*id) {
+		err2 = invalid_prefix_char(*id);
+		if (err2) {
+			memprintf(err, "invalid character '%c' in filter instance id '%s'", *err2, *id);
+			goto error;
+		}
+	}
+	return 0;
+
+  error:
+	free((void *)*cls_name);
+	free((void *)*id);
+	*cls_name = *id = NULL;
+	return -1;
+}
+
+/*
+ * Parses the "filter-sequence" keyword. The syntax is:
+ *
+ *   filter-sequence {global|request|response} <inst>:<pos>(<entity>) [<inst>:<pos>(<entity>) ...]
+ *
+ * where <pos> is 'before' or 'after': "A:before(B)" means the instance A
+ * is evaluated before the entity B (a class or a instance), "A:after(B)"
+ * means A is evaluated after B. The directive is
+ * only recorded here, the sequences are applied during the post-parsing
+ * stage (see flt_apply_sequences()).
+ */
+static int parse_filter_sequence(char **args, int section_type, struct proxy *curpx,
+				 const struct proxy *defpx, const char *file, int line, char **err)
+{
+	struct filter_sequence *seq = NULL;
+	const char *sep;
+	const char *entity;
+	char *left = NULL;
+	char *ref;
+	unsigned int side;
+	size_t entity_len;
+	enum flt_pos pos;
+	int cur_arg;
+	int ret = 0;
+
+	if ((curpx->cap & PR_CAP_DEF) && !*curpx->id) {
+		memprintf(err, "parsing [%s:%d] : '%s' not allowed in anonymous 'defaults' section.",
+			  file, line, args[0]);
+		return -1;
+	}
+
+	if (flt_check_config_mode(curpx, 0, err) < 0)
+		return -1;
+
+	if (!*args[1]) {
+		memprintf(err, "missing argument for '%s' in %s '%s'.", args[0], proxy_type_str(curpx), curpx->id);
+		goto error;
+	}
+	side = flt_parse_side(args[1]);
+	if (!side) {
+		memprintf(err, "'global', 'request' or 'response' expected.");
+		goto error;
+	}
+	if (!*args[2]) {
+		memprintf(err, "missing sequence. The syntax is: filter-sequence {global|request|response} <inst>:<pos>(<entity>) [<inst>:<pos>(<entity>) ...], with <pos> being 'before' or 'after'.");
+		goto error;
+	}
+
+	for (cur_arg = 2; *args[cur_arg]; cur_arg++) {
+		sep = strchr(args[cur_arg], ':');
+		if (!sep || sep == args[cur_arg])
+			goto invalid;
+		if (strncmp(sep + 1, "before(", 7) == 0)
+			pos = FLT_POS_BEFORE;
+		else if (strncmp(sep + 1, "after(", 6) == 0)
+			pos = FLT_POS_AFTER;
+		else
+			goto invalid;
+		entity = sep + 1 + (pos == FLT_POS_BEFORE ? 7 : 6);
+		entity_len = strlen(entity);
+		if (entity_len < 2 || entity[entity_len - 1] != ')')
+			goto invalid;
+		entity_len--;
+
+		seq = calloc(1, sizeof(*seq));
+		if (!seq)
+			goto oom;
+		LIST_INIT(&seq->list);
+		seq->side = side;
+		seq->pos = pos;
+		seq->file = strdup(file);
+		seq->line = line;
+		if (!seq->file)
+			goto oom;
+
+		left = my_strndup(args[cur_arg], sep - args[cur_arg]);
+		if (!left)
+			goto oom;
+		ret = flt_parse_entity(left, &seq->cls_name, &seq->id, err);
+		free(left);
+		left = NULL;
+		if (ret < 0)
+			goto error;
+		ref = my_strndup(entity, entity_len);
+		if (!ref)
+			goto oom;
+		ret = flt_parse_entity(ref, &seq->cls_ref_name, &seq->ref_id, err);
+		free(ref);
+		if (ret < 0)
+			goto error;
+
+		LIST_APPEND(&curpx->conf.filter_sequences, &seq->list);
+		seq = NULL;
+	}
+	return 0;
+
+  invalid:
+	memprintf(err, "invalid sequence '%s', expecting <inst>:before(<entity>) or <inst>:after(<entity>).",
+		  args[cur_arg]);
+	goto error;
+
+  oom:
+	memprintf(err, "out of memory");
+	/* fallthrough */
+  error:
+	memprintf(err, "parsing [%s:%d] : '%s' : %s.",
+		  file, line, args[0], err && *err ? *err : "invalid sequence");
+	flt_free_sequence(seq);
+	free(left);
+	return -1;
+
+}
+
+/* Parser for the "filter-api" keyword */
+static int parse_global_filter_api(char **args, int section_type,
+				   struct proxy *curpx, const struct proxy *defpx,
+				   const char *file, int line, char **err)
+{
+
+	if (too_many_args(1, args, err, NULL))
+		goto err;
+
+	if (*(args[1]) == 0) {
+		memprintf(err, "'%s' : expects 'default' or 'downgrade-to-legacy' as argument.\n", args[0]);
+		goto err;
+	}
+
+	if (strcmp(args[1], "default") == 0)
+		filter_api_downgraded = 0;
+	else if (strcmp(args[1], "downgrade-to-legacy") == 0)
+		filter_api_downgraded = 1;
+	else {
+		memprintf(err, "'%s' : unknown argument '%s' (expects 'default' or 'downgrade-to-legacy')",
+			  args[0], args[1]);
+		goto err;
+	}
+
+	return 0;
+  err:
+	return -1;
+}
+
+/* Note: must not be declared <const> as its list will be overwritten.
+ * Please take care of keeping this list alphabetically sorted, doing so helps
+ * all code contributors.
+ * Optional keywords are also declared with a NULL ->parse() function so that
+ * the config parser can report an appropriate error when a known keyword was
+ * not enabled. */
+static struct cfg_kw_list cfg_kws = {ILH, {
+		{ CFG_LISTEN, "filter", parse_filter },
+		{ CFG_LISTEN, "filter-config", parse_filter_config },
+		{ CFG_LISTEN, "filter-disable", parse_filter_enable },
+		{ CFG_LISTEN, "filter-enable", parse_filter_enable },
+		{ CFG_LISTEN, "filter-sequence", parse_filter_sequence },
+		{ CFG_GLOBAL, "filter-api", parse_global_filter_api },
+		{ 0, NULL, NULL },
+	}
+};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
+
+/* Enables or disables the filter instances referenced by the
+ * "filter-enable" and "filter-disable" directives of the proxy <proxy>.
+ * This happens during the post-parsing stage, so the directive order does
+ * not matter and inherited instances can be enabled/disabled. An error is
+ * reported if a referenced instance does not exist.
+ * Returns a combination of ERR_* flags, ERR_NONE on success.
+ */
+static int flt_enable_filters(struct proxy *proxy)
+{
+	struct filter_enabled *flt_en;
+	struct filter_class *cls;
+	int err_code = ERR_NONE;
+
+	list_for_each_entry(flt_en, &proxy->conf.filter_enabled, list) {
+		struct flt_enable_ctx ctx;
+
+		cls = filter_find_class(flt_en->cls_name);
+		if (!cls) {
+			ha_alert("config: %s '%s' : 'filter-%s' : unknown filter class '%s' (from %s:%d).\n",
+				 proxy_type_str(proxy), proxy->id,
+				 flt_en->enable ? "enable" : "disable", flt_en->cls_name,
+				 flt_en->file, flt_en->line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			continue;
+		}
+
+		ctx.cls = cls;
+		ctx.id = flt_en->id;
+		ctx.enable = flt_en->enable;
+		ctx.found = 0;
+		flt_foreach_instance_side(proxy, FLT_SIDE_GLOBAL, flt_enable_cb, &ctx);
+		if (!ctx.found) {
+			ha_alert("config: %s '%s' : 'filter-%s' : no instance of filter class '%s'%s%s%s (from %s:%d).\n",
+				 proxy_type_str(proxy), proxy->id,
+				 flt_en->enable ? "enable" : "disable", flt_en->cls_name,
+				 flt_en->id ? " with id '" : "",
+				 flt_en->id ? flt_en->id : "",
+				 flt_en->id ? "'" : "",
+				 flt_en->file, flt_en->line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+	}
+	return err_code;
+}
+
+
+/* Recursively checks that the instance <inst> does not create a loop in
+ * the reordered lists for side <side>. A instance is linked in exactly
+ * one list per side, so the structure is a forest: the FLT_INST_F_SEXPLORE
+ * flag, marking the instances on the current path, is enough to detect
+ * the loops. The flag is always cleared on the way out, even on error.
+ * Returns 0 if no loop is found, -1 otherwise.
+ */
+static int flt_check_instance_loop(struct filter_instance *inst, unsigned int side)
+{
+	struct filter_inst_side *ds = flt_inst_side(inst, side);
+	struct list *entry;
+	int ret = -1;
+
+	if (inst->flags & FLT_INST_F_SEXPLORE)
+		return -1;
+	inst->flags |= FLT_INST_F_SEXPLORE;
+	for (entry = ds->reordered_before.n; entry != &ds->reordered_before; entry = entry->n) {
+		if (flt_check_instance_loop(flt_inst_from_list(entry, side), side) < 0)
+			goto out;
+	}
+	for (entry = ds->reordered_after.n; entry != &ds->reordered_after; entry = entry->n) {
+		if (flt_check_instance_loop(flt_inst_from_list(entry, side), side) < 0)
+			goto out;
+	}
+	ret = 0;
+
+  out:
+	inst->flags &= ~FLT_INST_F_SEXPLORE;
+	return ret;
+}
+
+/* Applies the filter sequences of the proxy <proxy>, in configuration
+ * order. Each sequence moves a instance from its current list (its class
+ * instances list or a reordered list) to the reordered list of the
+ * reference entity: the reordered list of the class reference for the
+ * sequence's side, or the reordered list of the reference instance. A
+ * sequence is ignored if the instance to move does not exist, but the
+ * reference entity must exist.
+ * Returns a combination of ERR_* flags, ERR_NONE on success.
+ */
+static int flt_apply_sequences(struct proxy *proxy)
+{
+	struct filter_class_ref *ref;
+	struct filter_instance *inst, *ref_inst;
+	struct filter_inst_side *ds, *ref_ds;
+	struct list *target, *prev;
+	struct filter_sequence *seq;
+	struct filter_class *cls, *ref_cls;
+	int err_code = ERR_NONE;
+	int count;
+
+	list_for_each_entry(seq, &proxy->conf.filter_sequences, list) {
+		/* find the instance to move. Without id, the class must have
+		 * exactly one instance. If it does not exist, just ignore the
+		 * sequence.
+		 */
+		cls = filter_find_class(seq->cls_name);
+		if (!cls)
+			continue;
+		inst = flt_find_instance_count(proxy, cls, seq->id, &count);
+		if (!inst)
+			continue;
+		if (count > 1) {
+			ha_alert("config: %s '%s' : 'filter-sequence' : several instances of filter class '%s', an id is required (from %s:%d).\n",
+				 proxy_type_str(proxy), proxy->id, seq->cls_name,
+				 seq->file, seq->line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			continue;
+		}
+
+		/* the instance has no existence on a side its class is not
+		 * placed on: ignore the sequence
+		 */
+		if ((seq->side == FLT_SIDE_REQ && !LIST_INLIST(&inst->class->req.list)) ||
+		    (seq->side == FLT_SIDE_RES && !LIST_INLIST(&inst->class->res.list)))
+			continue;
+
+		/* find the reference entity */
+		ref_cls = filter_find_class(seq->cls_ref_name);
+		if (!ref_cls) {
+			ha_alert("config: %s '%s' : 'filter-sequence' : unknown filter class '%s' (from %s:%d).\n",
+				 proxy_type_str(proxy), proxy->id, seq->cls_ref_name,
+				 seq->file, seq->line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			continue;
+		}
+		ref = flt_get_class_ref(proxy, ref_cls, seq->side);
+		if (!ref) {
+			ha_alert("config: %s '%s' : 'filter-sequence' : filter class '%s' has no %s side (from %s:%d).\n",
+				 proxy_type_str(proxy), proxy->id, seq->cls_ref_name,
+				 flt_side_name(seq->side),
+				 seq->file, seq->line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			continue;
+		}
+		ref_inst = NULL;
+		if (seq->ref_id) {
+			ref_inst = flt_find_instance(proxy, ref_cls, seq->ref_id);
+			if (!ref_inst) {
+				ha_alert("config: %s '%s' : 'filter-sequence' : no instance of filter class '%s' with id '%s' (from %s:%d).\n",
+					 proxy_type_str(proxy), proxy->id, seq->cls_ref_name,
+					 seq->ref_id, seq->file, seq->line);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				continue;
+			}
+		}
+
+		/* Move only the selected order. The other two orders are independent. */
+		ds = flt_inst_side(inst, seq->side);
+		if (ref_inst) {
+			ref_ds = flt_inst_side(ref_inst, seq->side);
+			target = (seq->pos == FLT_POS_BEFORE ? &ref_ds->reordered_before : &ref_ds->reordered_after);
+		}
+		else
+			target = (seq->pos == FLT_POS_BEFORE ? &ref->reordered_before : &ref->reordered_after);
+		prev = ds->list.p;
+		LIST_DEL_INIT(&ds->list);
+		LIST_APPEND(target, &ds->list);
+
+		/* a loop must not be created by the sequences: check from the
+		 * moved instance after each sequence. It is enough: before
+		 * the move, there is no loop (checked after the previous
+		 * sequence), so a new loop necessarily involves the moved
+		 * instance.
+		 */
+		if (flt_check_instance_loop(inst, seq->side) < 0) {
+			/* Keep the global ownership tree and all side trees reachable
+			 * and loop-free for subsequent lookups and error cleanup.
+			 */
+			LIST_DEL_INIT(&ds->list);
+			LIST_INSERT(prev, &ds->list);
+			ha_alert("config: %s '%s' : 'filter-sequence' : a loop is detected around instance '%s%s%s' (from %s:%d).\n",
+				 proxy_type_str(proxy), proxy->id, inst->class->name,
+				 inst->id ? "/" : "", inst->id ? inst->id : "",
+				 seq->file, seq->line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+	}
+	return err_code;
+}
+
+/* Move a instance tree into its flat global/request/response list. Emit
+ * reordered-before instances, the instance, then reordered-after ones.
+ */
+static void flt_flatten_inst_list(struct proxy *px, struct list *instances, unsigned int side)
+{
+	struct filter_instance *inst;
+	struct filter_inst_side *ds;
+
+	while (!LIST_ISEMPTY(instances)) {
+		inst = flt_inst_from_list(instances->n, side);
+		ds = flt_inst_side(inst, side);
+		flt_flatten_inst_list(px, &ds->reordered_before, side);
+		LIST_DEL_INIT(&ds->list);
+		LIST_APPEND(flt_instances(px, side), &ds->list);
+		flt_flatten_inst_list(px, &ds->reordered_after, side);
+	}
+}
+
+/* Flattens the filter instances of the proxy <px>: the class-reference
+ * trees are consumed to produce the flat global, request and response lists
+ * of the proxy, in their respective evaluation orders. The class references and the consumed filter-enable and
+ * filter-sequence entries are released.
+ */
+static void flt_flatten_instances(struct proxy *px)
+{
+	struct filter_class_ref *ref, *refback;
+	struct filter_enabled *flt_en, *enback;
+	struct filter_sequence *seq, *seqback;
+	unsigned int side;
+
+	for (side = FLT_SIDE_REQ; side <= FLT_SIDE_GLOBAL; side <<= 1) {
+		list_for_each_entry_safe(ref, refback, flt_class_refs(px, side), list) {
+			flt_flatten_inst_list(px, &ref->reordered_before, side);
+			flt_flatten_inst_list(px, &ref->instances, side);
+			flt_flatten_inst_list(px, &ref->reordered_after, side);
+			LIST_DELETE(&ref->list);
+			free(ref);
+		}
+	}
+
+	/* release the consumed filter-enable and filter-sequence entries */
+	list_for_each_entry_safe(flt_en, enback, &px->conf.filter_enabled, list)
+		flt_free_enabled(flt_en);
+	list_for_each_entry_safe(seq, seqback, &px->conf.filter_sequences, list)
+		flt_free_sequence(seq);
+}
+
+/* Post-parses the filter instances of the proxy <proxy>. For each
+ * instance, some sanity checks are performed and the ->parse() callback of
+ * the filter class is called to produce the filter configuration
+ * (inst->fconf). This happens after the configuration parsing, during the
+ * post-parsing stage. Returns a combination of ERR_* flags, ERR_NONE on
+ * success.
+ */
+static int flt_preinit_instance(struct proxy *proxy, struct filter_instance *inst)
+{
+	char *err = NULL;
+
+	if (!inst->class->parse) {
+		ha_alert("config: %s '%s' : filter class '%s' does not support 'filter-config' (instance from %s:%d).\n",
+			 proxy_type_str(proxy), proxy->id, inst->class->name,
+			 inst->conf.file, inst->conf.line);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	inst->fconf = calloc(1, sizeof(*inst->fconf));
+	if (!inst->fconf) {
+		ha_alert("config: %s '%s' : out of memory.\n",
+			 proxy_type_str(proxy), proxy->id);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	inst->fconf->name = inst->class->name;
+
+	if (inst->class->parse(inst->conf.argv, proxy, inst, &err) < 0) {
+		ha_alert("config: %s '%s' : error in instance of filter class '%s' from %s:%d : %s.\n",
+			 proxy_type_str(proxy), proxy->id, inst->class->name,
+			 inst->conf.file, inst->conf.line,
+			 err && *err ? err : "unknown error");
+		free(err);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	free(err);
+	if (!inst->fconf->ops) {
+		ha_alert("config: %s '%s' : filter class '%s' defined no callbacks for the instance from %s:%d.\n",
+			 proxy_type_str(proxy), proxy->id, inst->class->name,
+			 inst->conf.file, inst->conf.line);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return ERR_NONE;
+}
+
+/* Post-parses the instances of the class reference <ref>. Only one
+ * instance is allowed for classes without FLT_CLS_FL_MULTI. Returns a
+ * combination of ERR_* flags, ERR_NONE on success.
+ */
+static int flt_preinit_class_instances(struct proxy *proxy, struct filter_class_ref *ref)
+{
+	struct filter_instance *inst;
+	int err_code = ERR_NONE;
+	int count = 0;
+
+	list_for_each_entry(inst, &ref->instances, global.list)
+		count++;
+
+	if (count > 1 && !(ref->class->flags & FLT_CLS_FL_MULTI)) {
+		list_for_each_entry(inst, &ref->instances, global.list) {
+			ha_alert("config: %s '%s' : several instances of filter class '%s', but only one is allowed (see %s:%d).\n",
+				 proxy_type_str(proxy), proxy->id, ref->class->name,
+				 inst->conf.file, inst->conf.line);
+		}
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	list_for_each_entry(inst, &ref->instances, global.list)
+		err_code |= flt_preinit_instance(proxy, inst);
+	return err_code;
+}
+
+static int flt_preinit_instances(struct proxy *proxy)
+{
+	struct filter_class_ref *ref;
+	int err_code = ERR_NONE;
+
+	/* Mirrored implicit instances in legacy mode are only metadata. Their
+	 * parsers must not modify the proxy options or allocate unused configs.
+	 */
+	if (flt_use_legacy_filter(proxy))
+		return ERR_NONE;
+
+	/* Finalize every instance once, following the global class order. */
+	list_for_each_entry(ref, &proxy->conf.filter_refs, list)
+		err_code |= flt_preinit_class_instances(proxy, ref);
+	return err_code;
+}
+
+
+/* Returns true if the proxy <px> has at least one filter instance, explicit
+ * or implicit, in its configuration state. Must be called before the instances
+ * are flattened in px->filter_instances, so they are walked through their
+ * class references.
+ */
+static int flt_has_conf_instances(const struct proxy *px)
+{
+	struct filter_class_ref *ref;
+
+	list_for_each_entry(ref, &px->conf.filter_refs, list) {
+		if (!LIST_ISEMPTY(&ref->instances))
+			return 1;
+	}
+	return 0;
+}
+
+/* Returns true if the proxy <px> has a filter instance of the filter owning
+ * the callbacks table <ops>. A filter supporting the new mode registers a
+ * class whose parse callback produces configurations with the same callbacks
+ * table as its legacy keyword parser (see flt_parse_instance_legacy()), so
+ * the table identifies the filter behind a configuration. Must be called
+ * after the instances were finalized, when their configuration exists.
+ */
+static int flt_conf_has_instance(struct proxy *px, const struct flt_ops *ops)
+{
+	struct filter_class_ref *ref;
+	struct filter_instance *inst;
+
+	list_for_each_entry(ref, &px->conf.filter_refs, list) {
+		list_for_each_entry(inst, &ref->instances, global.list) {
+			if (inst->fconf && inst->fconf->ops == ops)
+				return 1;
+		}
+	}
+	return 0;
+}
+
+/* Warns about the legacy filter configurations of the proxy <px> that the new
+ * filter API ignores. Only the filter instances are evaluated in the new
+ * mode: a legacy filter configuration with no instance of the same filter is
+ * never used, and the filter it configures does not work. Such a
+ * configuration comes from an implicit declaration of a filter that
+ * registered no class, an explicit "filter" directive would have selected the
+ * legacy mode for the whole proxy. The relation between a configuration and
+ * the instances of its filter relies on the callbacks table of the filter,
+ * see flt_conf_has_instance(). Must be called when the proxy uses the new
+ * mode, after its instances were finalized and before they are flattened.
+ */
+static void flt_warn_ignored_conf(struct proxy *px)
+{
+	struct flt_conf *fconf;
+
+	if (flt_use_legacy_filter(px) || LIST_ISEMPTY(&px->filter_configs))
+		return;
+
+	list_for_each_entry(fconf, &px->filter_configs, list) {
+		if (flt_conf_has_instance(px, fconf->ops))
+			continue;
+		ha_warning("config: %s '%s' : ignoring the legacy filter configuration '%s'. "
+			   "Declare all filters with the 'filter' directive or use the 'filter-api "
+			   "downgrade-to-legacy' option to evaluate it with the legacy filter API.\n",
+			   proxy_type_str(px), px->id,
+			   fconf->id ? fconf->id : (fconf->name ? fconf->name : "<unnamed>"));
+	}
+}
+
+
+/* Applies the default filter mode on the proxy <px>, when it used no explicit
+ * filter declaration (neither "filter" nor "filter-*" directives): the mode
+ * is deduced from the filter configurations and the filter instances implied
+ * by the other directives. A proxy with only filter configurations, and no
+ * instance, uses the legacy mode: an implied filter not supporting the new
+ * mode declares no class, hence no instance. A proxy with filter instances
+ * uses the new mode: the implied filters all declared their classes. A proxy
+ * with both may mix implied filters of the two kinds, and uses the new mode,
+ * so the legacy-only ones are ignored, as any class-less filter in the new
+ * mode. A proxy with explicit declarations keeps the mode it selected: the
+ * legacy mode for the "filter" directives, the new one for the "filter-*"
+ * directives. When the legacy filter mode was requested globally, a proxy
+ * with no explicit declaration uses the legacy mode instead of the new one,
+ * whatever it deduced, so the implicit declarations of the filters not
+ * supporting the new mode keep working.
+ */
+static void flt_apply_default_mode(struct proxy *px)
+{
+	if (flt_use_legacy_filter(px) || flt_has_explicit_config(px))
+		return;
+
+	if (filter_api_downgraded == 1) {
+		px->flags |= PR_FL_FILTER_LEGACY;
+		return;
+	}
+
+	/* Filter configurations with no instance: the implied filters declared
+	 * no class, so they are only usable in the legacy mode.
+	 */
+	if (!LIST_ISEMPTY(&px->filter_configs) && !flt_has_conf_instances(px)) {
+		struct flt_conf *fconf;
+		int first = 1;
+
+		chunk_reset(&trash);
+		chunk_printf(&trash, "config: %s '%s' : All filters used are relying only on legacy API "
+			     "(set 'filter-api downgrade-to-legacy' in a global section to remove this warning): \n\t",
+			     proxy_type_str(px), px->id);
+		list_for_each_entry(fconf, &px->filter_configs, list) {
+			chunk_appendf(&trash, "%s'%s'", (first ? " " : ", "), fconf->id);
+			first = 0;
+		}
+		ha_warning("%.*s\n", (int)trash.data, trash.area);
+
+		px->flags |= PR_FL_FILTER_LEGACY;
+	}
+}
+
+/* Calls flt_preinit_instances() for all proxies, see above */
+int flt_preinit_instances_all(void)
+{
+	struct proxy *px;
+	int err_code = ERR_NONE;
+
+	/* Apply the globally requested mode before finalizing the filter
+	 * instances, so the proxies using the legacy mode by default keep
+	 * their instances as metadata only.
+	 */
+	list_for_each_entry(px, &main_proxies, el)
+		flt_apply_default_mode(px);
+
+	list_for_each_entry(px, &main_proxies, el) {
+		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+			continue;
+
+		err_code |= flt_preinit_instances(px);
+		if (err_code & (ERR_ABORT|ERR_FATAL)) {
+			ha_alert("Failed to parse the filter instances of proxy '%s'.\n",
+				 px->id);
+			return err_code;
+		}
+		/* The instances are finalized: the legacy configurations of the
+		 * filters that registered no class, ignored by the new mode,
+		 * are identified now, before the class references are released.
+		 */
+		flt_warn_ignored_conf(px);
+		err_code |= flt_enable_filters(px);
+		if (err_code & (ERR_ABORT|ERR_FATAL)) {
+			ha_alert("Failed to apply the filter-enable/filter-disable directives of proxy '%s'.\n",
+				 px->id);
+			return err_code;
+		}
+		err_code |= flt_apply_sequences(px);
+		if (err_code & (ERR_ABORT|ERR_FATAL)) {
+			ha_alert("Failed to apply the filter sequences of proxy '%s'.\n",
+				 px->id);
+			return err_code;
+		}
+		/* Produce all three flat orders and release the configuration
+		 * structures
+		 */
+		flt_flatten_instances(px);
+	}
+	return 0;
+}
+
+/**************************************************************************
+ * Filter instances of proxies created at runtime
+ *************************************************************************/
+
+/* Deferred per-thread work item for a proxy created at runtime: runs
+ * flt_init_per_thread() for the proxy <arg.ptr>, in the context of the
+ * thread the item was posted to, as the filters may initialize thread-local
+ * variables. The ERR_* flags are returned to the completion callback, but
+ * only for reporting: the creation of the proxy cannot be aborted anymore.
+ */
+static union twork_arg flt_twork_init_per_thread(union twork_arg arg)
+{
+	struct proxy *px = arg.ptr;
+	int err_code;
+
+	err_code = flt_init_per_thread(px);
+	if (err_code & (ERR_ABORT|ERR_FATAL))
+		ha_alert("Failed to initialize the per-thread filters of proxy '%s' for thread %u.\n",
+			 px->id, tid);
+	return twk_u32(err_code);
+}
+
+/* Deferred per-thread work item for a proxy created at runtime: runs
+ * flt_deinit_per_thread() for the proxy <arg.ptr>, in the context of the
+ * thread the item was posted to, as the filters may release thread-local
+ * variables.
+ */
+static union twork_arg flt_twork_deinit_per_thread(union twork_arg arg)
+{
+	flt_deinit_per_thread(arg.ptr);
+	return twk_u32(ERR_NONE);
+}
+
+/* Completion callback of the deferred per-thread work items of a proxy
+ * created at runtime, running on the thread that posted them: releases the
+ * reference the item held on the proxy, so the completion of the last item
+ * marks the completion of the per-thread callbacks of every thread.
+ */
+static void flt_twork_done(union twork_arg arg, union twork_arg ret)
+{
+	proxy_drop(arg.ptr);
+}
+
+/* Finalizes the filter instances of the proxy <px> created at runtime (for
+ * now only with the "add backend" CLI command, after the instances inherited
+ * from its defaults section were copied): the parse callback of every
+ * instance is called to produce its filter configuration, the
+ * filter-enable/filter-disable and filter-sequence directives are applied,
+ * and the three evaluation orders are flattened. This mirrors the
+ * pre-initialization of the instances at startup, so
+ * flt_start_new_proxy() must be called before
+ * proxy_finalize(), while the threads are isolated, so that the filter
+ * analyzers are enabled if the proxy has filters.
+ * Returns a combination of ERR_* flags, ERR_NONE on success.
+ */
+int flt_start_new_proxy(struct proxy *px)
+{
+	int err_code = ERR_NONE;
+
+	/* The filter mode of a new proxy may depend on the globally requested
+	 * one, apply it before finalizing the filter instances.
+	 */
+	flt_apply_default_mode(px);
+
+	err_code |= flt_preinit_instances(px);
+	if (!(err_code & (ERR_ABORT|ERR_FATAL)))
+		err_code |= flt_enable_filters(px);
+	if (!(err_code & (ERR_ABORT|ERR_FATAL)))
+		err_code |= flt_apply_sequences(px);
+
+	if (err_code & (ERR_ABORT|ERR_FATAL)) {
+		ha_alert("Failed to finalize the filter instances of proxy '%s'.\n",
+			 px->id);
+		return err_code;
+	}
+
+	/* Produce the flat evaluation orders and release the configuration
+	 * structures
+	 */
+	flt_flatten_instances(px);
+	return ERR_NONE;
+}
+
+/* Initializes the filters of the proxy <px> created at runtime, mirroring the
+ * post-check and per-thread initialization stages of the startup:
+ *
+ * - the 'init' callbacks run on the main thread during the startup, before
+ *   the threads are started, so they run here on the thread performing the
+ *   creation, with all the other threads isolated;
+ *
+ * - the 'init_per_thread' callbacks run on every thread during the startup,
+ *   as the filters may initialize thread-local variables. The other threads
+ *   being parked by the thread isolation, each callback is deferred to its
+ *   thread with a twork item: the items are queued while the threads are
+ *   still parked and run as their first pending work when they resume. The
+ *   new proxy is not reachable by the switching rules until it is published
+ *   with "publish backend", which happens after the items completed; only
+ *   "force-be-switch" could select it in-between.
+ *
+ * Each item holds a reference on the proxy, so the proxy cannot be destroyed
+ * before its per-thread callbacks ran (e.g. by a concurrent "del backend").
+ * flt_init_new_proxy() must be called after flt_start_new_proxy() and the
+ * post-proxy-check callbacks, while the threads are isolated.
+ * Returns a combination of ERR_* flags, ERR_NONE on success.
+ */
+int flt_init_new_proxy(struct proxy *px)
+{
+	int err_code = ERR_NONE;
+	int t;
+
+	BUG_ON(!thread_isolated());
+
+	err_code |= flt_init(px);
+	if (err_code & (ERR_ABORT|ERR_FATAL)) {
+		ha_alert("Failed to initialize the filters of proxy '%s'.\n", px->id);
+		return err_code;
+	}
+
+	/* nothing to defer without filter */
+	if (LIST_ISEMPTY(&px->filter_instances) && LIST_ISEMPTY(&px->filter_configs))
+		return ERR_NONE;
+
+	for (t = 0; t < global.nbthread; t++) {
+		proxy_take(px);
+		if (twork_call_on(NULL, t, flt_twork_init_per_thread, twk_ptr(px),
+				  flt_twork_done))
+			continue;
+
+		/* the item could not be queued: release the reference taken
+		 * for it and report the failure. The creation will be aborted,
+		 * so also defer the deinitialization of the threads already
+		 * notified, to balance their per-thread initialization.
+		 */
+		proxy_drop(px);
+		err_code |= ERR_ALERT|ERR_FATAL;
+		ha_alert("Failed to defer the per-thread filter initialization of proxy '%s' for thread %u.\n",
+			 px->id, t);
+		while (t-- > 0) {
+			proxy_take(px);
+			if (!twork_call_on(NULL, t, flt_twork_deinit_per_thread,
+					    twk_ptr(px), flt_twork_done))
+				proxy_drop(px);
+		}
+		return err_code;
+	}
+	return ERR_NONE;
+}
+
+/* Deinitializes the per-thread filters of the proxy <px> created at runtime
+ * (for now only with the "del backend" CLI command), mirroring the
+ * per-thread deinitialization stage of the shutdown: the
+ * 'deinit_per_thread' callbacks are deferred to each thread with twork
+ * items, queued while the threads are still parked by the thread isolation
+ * of the deletion. The callbacks may release thread-local variables or
+ * per-thread resources (e.g. references in the per-thread Lua states), so
+ * they must complete before the proxy is destroyed: each item holds a
+ * reference on the proxy, and the caller only releases the creation
+ * reference, so the proxy memory is freed by the completion of the last
+ * item, once every thread ran its callbacks.
+ */
+void flt_deinit_new_proxy(struct proxy *px)
+{
+	int t;
+
+	BUG_ON(!thread_isolated());
+
+	/* nothing to defer without filter */
+	if (LIST_ISEMPTY(&px->filter_instances) && LIST_ISEMPTY(&px->filter_configs))
+		return;
+
+	for (t = 0; t < global.nbthread; t++) {
+		proxy_take(px);
+		if (twork_call_on(NULL, t, flt_twork_deinit_per_thread, twk_ptr(px),
+				  flt_twork_done))
+			continue;
+
+		/* the item could not be queued: release the reference taken
+		 * for it. The per-thread resources of this thread, if any,
+		 * leak with the proxy, which is about to be destroyed.
+		 */
+		proxy_drop(px);
+		ha_alert("Failed to defer the per-thread filter deinitialization of proxy '%s' for thread %u.\n",
+			 px->id, t);
+	}
+}
+
+/* Dump classes walking the placement tree of <side>. The classes placed
+ * before the current one are dumped first, then the class itself, then the
+ * ones placed after it.
+ */
+static void cli_dump_flt_classes(struct buffer *out, struct list *classes, unsigned int side, int *first)
+{
+	struct filter_class *cls;
+	struct filter_class_side *cs;
+	struct list *entry;
+
+	for (entry = classes->n; entry != classes; entry = entry->n) {
+		cls = flt_class_from_list(entry, side);
+		cs = flt_class_side(cls, side);
+		cli_dump_flt_classes(out, &cs->before, side, first);
+		chunk_appendf(out, "%s%s", *first ? "" : " > ", cls->name);
+		*first = 0;
+		cli_dump_flt_classes(out, &cs->after, side, first);
+	}
+}
+
+/* Parses "show filter classes [global|request|response]". No side means all three. */
+static int cli_parse_show_flt_classes(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	const unsigned int sides[] = { FLT_SIDE_GLOBAL, FLT_SIDE_REQ, FLT_SIDE_RES };
+	struct list *classes;
+	unsigned int selected;
+	int i, first;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
+		return 1;
+	selected = flt_parse_side(args[3]);
+	if (*args[3] && !selected)
+		return cli_err(appctx, "'global', 'request' or 'response' expected\n");
+
+	chunk_reset(&trash);
+	for (i = 0; i < sizeof(sides) / sizeof(sides[0]); i++) {
+		if (selected && selected != sides[i])
+			continue;
+		classes = flt_class_order(sides[i]);
+		first = 1;
+		chunk_appendf(&trash, "%s: ", flt_side_name(sides[i]));
+		cli_dump_flt_classes(&trash, classes, sides[i], &first);
+		if (first)
+			chunk_appendf(&trash, "<none>");
+		chunk_appendf(&trash, "\n");
+	}
+	return cli_msg(appctx, LOG_INFO, trash.area);
+}
+
+
+
+struct cli_flt_instances_ctx {
+	struct buffer *out;
+	int first;
+};
+
+/* Dump a instance from either a flat order or unflattened class references. */
+static int cli_dump_flt_instance_cb(struct filter_instance *inst, void *data)
+{
+	struct cli_flt_instances_ctx *ctx = data;
+
+	chunk_appendf(ctx->out, "%s%s", ctx->first ? "" : " > ", inst->class->name);
+	if (inst->id)
+		chunk_appendf(ctx->out, "/%s", inst->id);
+	ctx->first = 0;
+	return 0;
+}
+
+/* Parse "show filter instances <px> [global|request|response]". Display one
+ * line per order, including defaults' unflattened instances. No side means
+ * all three orders.
+ */
+static int cli_parse_show_flt_instances(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	const unsigned int sides[] = { FLT_SIDE_GLOBAL, FLT_SIDE_REQ, FLT_SIDE_RES };
+	struct cli_flt_instances_ctx ctx = { .out = &trash };
+	struct proxy *px;
+	unsigned int selected;
+	int i;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
+		return 1;
+
+	if (!*args[3])
+		return cli_err(appctx, "a proxy name is expected\n");
+
+	px = proxy_find_by_name(args[3], 0, 0);
+	if (!px)
+		px = proxy_find_by_name(args[3], PR_CAP_DEF, 0);
+	if (!px)
+		return cli_err(appctx, "unknown proxy\n");
+
+	selected = flt_parse_side(args[4]);
+	if (*args[4] && !selected)
+		return cli_err(appctx, "'global', 'request' or 'response' expected\n");
+
+	chunk_reset(&trash);
+	for (i = 0; i < sizeof(sides) / sizeof(sides[0]); i++) {
+		if (selected && selected != sides[i])
+			continue;
+		ctx.first = 1;
+		chunk_appendf(&trash, "%s: ", flt_side_name(sides[i]));
+		flt_foreach_instance(flt_instances(px, sides[i]), sides[i], cli_dump_flt_instance_cb, &ctx);
+		flt_foreach_instance_side(px, sides[i], cli_dump_flt_instance_cb, &ctx);
+		if (ctx.first)
+			chunk_appendf(&trash, "<none>");
+		chunk_appendf(&trash, "\n");
+	}
+	return cli_msg(appctx, LOG_INFO, trash.area);
+}
+
+/* Parse "show filter instance <px> <class[/id]>". Displays all the
+ * information of a single filter instance of the proxy <px>.
+ */
+static int cli_parse_show_flt_instance(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct filter_instance *found = NULL;
+	struct filter_class *cls;
+	struct proxy *px;
+	char *id = NULL;
+	int count = 0;
+	int i;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
+		return 1;
+
+	if (!*args[3] || !*args[4])
+		return cli_err(appctx, "a proxy name and a instance (class[/id]) are expected\n");
+
+	px = proxy_find_by_name(args[3], 0, 0);
+	if (!px)
+		px = proxy_find_by_name(args[3], PR_CAP_DEF, 0);
+	if (!px)
+		return cli_err(appctx, "unknown proxy\n");
+
+	/* split the class[/id] argument (args are strdup'ed, it can be
+	 * modified in place)
+	 */
+	id = strchr(args[4], '/');
+	if (id)
+		*id++ = '\0';
+
+	cls = filter_find_class(args[4]);
+	if (cls)
+		found = flt_find_instance_count(px, cls, id, &count);
+	else
+		return cli_err(appctx, "unknown filter class\n");
+
+	if (id && !found)
+		return cli_err(appctx, "unknown instance\n");
+	if (!id && count > 1)
+		return cli_err(appctx, "several instances of this class, an id is required\n");
+	if (!found)
+		return cli_err(appctx, "no instance of this class for this proxy\n");
+
+	chunk_reset(&trash);
+	chunk_appendf(&trash, "class:      %s\n", found->class->name);
+	chunk_appendf(&trash, "id:         %s\n", found->id ? found->id : "<none>");
+	chunk_appendf(&trash, "state:      %s%s%s\n",
+		      found->enabled ? "enabled" : "disabled",
+		      (found->flags & FLT_INST_F_IMPLICIT) ? ", implicit" : "",
+		      (found->flags & FLT_INST_F_INHERITED) ? ", inherited" : "");
+	chunk_appendf(&trash, "sides:      global%s%s\n",
+		      LIST_INLIST(&found->class->req.list) ? " request" : "",
+		      LIST_INLIST(&found->class->res.list) ? " response" : "");
+	chunk_appendf(&trash, "defined at: %s:%d\n", found->conf.file, found->conf.line);
+	chunk_appendf(&trash, "args:      ");
+	if (found->conf.argc) {
+		for (i = 0; i < found->conf.argc; i++)
+			chunk_appendf(&trash, " %s", found->conf.argv[i]);
+	}
+	else
+		chunk_appendf(&trash, " <none>");
+	chunk_appendf(&trash, "\n");
+
+	return cli_msg(appctx, LOG_INFO, trash.area);
+}
+
+static struct cli_kw_list cli_kws = {ILH, {
+	{{ "show", "filter", "classes", NULL }, "show filter classes [global|request|response] : display all filter classes", cli_parse_show_flt_classes, NULL, NULL, NULL },
+	{{ "show", "filter", "instance", NULL }, "show filter instance <px> <class[/id]> : display a filter instance of a proxy", cli_parse_show_flt_instance, NULL, NULL, NULL },
+	{{ "show", "filter", "instances", NULL }, "show filter instances <px> [global|request|response] : display the filter instances of a proxy", cli_parse_show_flt_instances, NULL, NULL, NULL },
+	{{},}
+}};
+
+INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
+
+/* Checks that all registered filter classes are placed on at least one
+ * side. The classes are placed with filter_place_class() (see
+ * filter_init_classes() for the internal classes), so a class without
+ * placement is useless and most probably comes from a module registration
+ * bug.
+ * Returns a combination of ERR_* flags, ERR_NONE on success.
+ */
+static int flt_precheck_classes()
+{
+	struct filter_class *cls;
+	int err_code = ERR_NONE;
+
+	list_for_each_entry(cls, &filter_classes, list) {
+		if (!LIST_INLIST(&cls->req.list) && !LIST_INLIST(&cls->res.list)) {
+			ha_alert("filters: class '%s' is placed neither on the request side nor on the response side.\n",
+				 cls->name);
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+	}
+	return err_code;
+}
+
+/* Helper function used to initialized a filter class with the given name,
+ * flags (FLT_CLS_FL_*) and instance parsing function (may be NULL).
+ */
+static inline void flt_init_class(struct filter_class *cls, const char *name, unsigned int flags,
+				  int (*parse)(char **args, struct proxy *px,
+					       struct filter_instance *inst, char **err))
+{
+	cls->name = name;
+	cls->flags = flags;
+	cls->parse = parse;
+	LIST_INIT(&cls->global.before);
+	LIST_INIT(&cls->global.after);
+	LIST_INIT(&cls->global.list);
+	cls->global.placed = 0;
+
+	LIST_INIT(&cls->req.before);
+	LIST_INIT(&cls->req.after);
+	LIST_INIT(&cls->req.list);
+	cls->req.placed = 0;
+
+	LIST_INIT(&cls->res.before);
+	LIST_INIT(&cls->res.after);
+	LIST_INIT(&cls->res.list);
+	cls->res.placed = 0;
+}
+
+/* Finds a filter class by name in the global registry, NULL if unknown. */
+struct filter_class *filter_find_class(const char *name)
+{
+	struct filter_class *cls;
+
+	list_for_each_entry(cls, &filter_classes, list) {
+		if (strcmp(cls->name, name) == 0)
+			return cls;
+	}
+	return NULL;
+}
+
+/* Create class references in the class order of <side>, following the class
+ * placement tree. Returns 0 on success, -1 on error.
+ */
+static int flt_init_class_refs_side(struct proxy *px, struct list *classes, unsigned int side)
+{
+	struct filter_class *cls;
+	struct filter_class_side *cs;
+	struct filter_class_ref *ref;
+	struct list *entry;
+
+	for (entry = classes->n; entry != classes; entry = entry->n) {
+		cls = flt_class_from_list(entry, side);
+		cs = flt_class_side(cls, side);
+		if (flt_init_class_refs_side(px, &cs->before, side) < 0)
+			return -1;
+
+		ref = calloc(1, sizeof(*ref));
+		if (!ref)
+			return -1;
+		ref->class = cls;
+		LIST_INIT(&ref->instances);
+		LIST_INIT(&ref->reordered_before);
+		LIST_INIT(&ref->reordered_after);
+		LIST_APPEND(flt_class_refs(px, side), &ref->list);
+
+		if (flt_init_class_refs_side(px, &cs->after, side) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+/* Creates the filter class references of the proxy <px>: one global reference
+ * per registered class, plus references on each side the class is placed on.
+ * The order of each side follows the class placement tree of that side.
+ * It is called during the proxy initialization, so all filter classes must be
+ * registered first.
+ * Returns 0 on success, -1 on error.
+ */
+int flt_init_class_refs(struct proxy *px)
+{
+	if (flt_init_class_refs_side(px, &global_filter_classes, FLT_SIDE_GLOBAL) < 0)
+		goto error;
+	if (flt_init_class_refs_side(px, &req_filter_classes, FLT_SIDE_REQ) < 0)
+		goto error;
+	if (flt_init_class_refs_side(px, &res_filter_classes, FLT_SIDE_RES) < 0)
+		goto error;
+	return 0;
+  error:
+	flt_free_instances(px);
+	return -1;
+}
+
+/* Helper function for filter classes: calls the legacy "filter" keyword
+ * parsing function <parse> on the arguments of the filter instance <inst>,
+ * as if the line "filter <kw> <inst args...>" was found in the configuration
+ * of the proxy <px>. <private> is passed as-is to the parsing function.
+ * Returns 0 on success, < 0 on error.
+ */
+int flt_parse_instance_legacy(struct proxy *px, struct filter_instance *inst, char **err,
+			 const char *kw,
+			 int (*parse)(char **args, int *cur_arg, struct proxy *px,
+				      struct flt_conf *fconf, char **err, void *private),
+			 void *private)
+{
+	char *fargs[MAX_LINE_ARGS+1];
+	int i, ret, cur_arg;
+
+	/* the legacy parsing functions expect the keyword at args[*cur_arg],
+	 * followed by the filter arguments. Like for the config parser, the
+	 * arguments must be terminated by an empty string, not a NULL pointer.
+	 */
+
+	fargs[0] = (char *)kw;
+	for (i = 0; inst->conf.argv[i] && *inst->conf.argv[i]; i++)
+		fargs[i+1] = inst->conf.argv[i];
+	fargs[i+1] = "";
+
+	cur_arg = 0;
+	ret = parse(fargs, &cur_arg, px, inst->fconf, err, private);
+	if (ret == 0 && *fargs[cur_arg]) {
+		/* some arguments were not consumed by the parsing function */
+		memprintf(err, "'filter-config %s' : unknown keyword '%s'",
+		          inst->class->name, fargs[cur_arg]);
+		ret = -1;
+	}
+	return ret;
+}
+
+/* Registers a new filter class, with the parsing function <parse> used to
+ * finalize the filter instances of this class (may be NULL if the class does
+ * not support the "filter-config" directive). The class is initialized with
+ * the class flags <flags> (FLT_CLS_FL_*) and added to the global registry of
+ * the known classes, and appended at the end of the global order. It is not
+ * usable on any channel side until placed with filter_place_class(). Must be
+ * called after filter_init_classes(), which runs at the prepare stage: a
+ * class registered from the register stage on is added in time for
+ * "haproxy -vv" to list it, a class registered later is reported by the CLI
+ * alone.
+ * Returns 0 on success, -1 on error (too early call, duplicate name).
+ */
+int filter_register_class(struct filter_class *cls, const char *name,
+			  unsigned int flags,
+			  int (*parse)(char **args, struct proxy *px,
+				       struct filter_instance *inst, char **err))
+{
+	const char *err;
+	int ret = -1;
+
+	if (!filter_classes_initialized) {
+		ha_alert("filters: class '%s' registered before internal classes were initialized\n", name);
+		goto out;
+	}
+	if (filter_find_class(name)) {
+		ha_alert("filters: duplicate filter class name '%s'\n", name);
+		goto out;
+	}
+	err = invalid_prefix_char(name);
+	if (err) {
+		ha_alert("filters: character '%c' is not permitted in filter class name.\n", *err);
+		goto out;
+	}
+
+	flt_init_class(cls, name, flags, parse);
+	LIST_APPEND(&filter_classes, &cls->list);
+	LIST_APPEND(&global_filter_classes, &cls->global.list);
+	ret = 0;
+  out:
+	return ret;
+}
+
+/* Places <cls> in the order of <side> (FLT_SIDE_GLOBAL, FLT_SIDE_REQ or
+ * FLT_SIDE_RES), before or after the reference class <ref_name>. The class is
+ * appended in the reference class' .before or .after constraint list of that
+ * side; the final evaluation order is resolved later.
+ *
+ * The global side is the order used for the side-independent operations
+ * (configuration checks, initialization and destruction), while the request
+ * and the response sides drive the stream evaluation order.
+ *
+ * Call it once per side; the positions may differ per side.
+ * Returns 0 on success, -1 on error (unknown ref, ref not present on that side,
+ * class already placed on that side).
+ */
+int filter_place_class(struct filter_class *cls, unsigned int side,
+		       const char *ref_name, enum flt_pos pos)
+{
+	struct filter_class *ref;
+	struct filter_class_side *cs, *ref_cs;
+	int ret = -1;
+
+	if (!filter_classes_initialized) {
+		ha_alert("filters: class '%s' placed before internal classes were initialized\n", cls->name);
+		goto out;
+	}
+	if (side != FLT_SIDE_GLOBAL && side != FLT_SIDE_REQ && side != FLT_SIDE_RES) {
+		ha_alert("filters: class '%s' placement requires a global, request or response side\n", cls->name);
+		goto out;
+	}
+	ref = filter_find_class(ref_name);
+	if (!ref) {
+		ha_alert("filters: unknown reference class '%s' for class '%s'\n", ref_name, cls->name);
+		goto out;
+	}
+	if (ref == cls) {
+		ha_alert("filters: class '%s' cannot be placed relative to itself\n", cls->name);
+		goto out;
+	}
+
+	cs = flt_class_side(cls, side);
+	ref_cs = flt_class_side(ref, side);
+
+	if (cs->placed) {
+		ha_alert("filters: class '%s' already placed on the %s side\n",
+			 cls->name, flt_side_name(side));
+		goto out;
+	}
+
+	if (side == FLT_SIDE_GLOBAL) {
+		/* The class is already linked in the global order, it was
+		 * appended there at registration. Move it to the requested
+		 * position, relative to the reference class.
+		 */
+		LIST_DEL_INIT(&cs->list);
+	}
+	else if (!LIST_INLIST(&ref_cs->list)) {
+		/* A channel order only contains the classes used on that
+		 * channel, so the reference must be placed on it. The global
+		 * order accepts any registered class as a reference, since it
+		 * contains all of them.
+		 */
+		ha_alert("filters: reference class '%s' has no %s side\n",
+			 ref_name, flt_side_name(side));
+		goto out;
+	}
+
+	LIST_APPEND((pos == FLT_POS_BEFORE) ? &ref_cs->before : &ref_cs->after, &cs->list);
+	cs->placed = 1;
+	ret = 0;
+  out:
+	return ret;
+}
+
+/* Detaches <cls> from the three class orders. Used by the registration
+ * cleanup path, when the class is about to be dropped.
+ */
+static void flt_unplace_class(struct filter_class *cls)
+{
+	unsigned int side;
+
+	for (side = FLT_SIDE_REQ; side <= FLT_SIDE_GLOBAL; side <<= 1) {
+		struct filter_class_side *cs = flt_class_side(cls, side);
+
+		if (LIST_INLIST(&cs->list))
+			LIST_DEL_INIT(&cs->list);
+		cs->placed = 0;
+	}
+}
+
+/* Registers a new filter class named <name> with the class flags <flags>
+ * (FLT_CLS_FL_*) and places it on the global side and on both channel sides,
+ * before or after the reference class <ref_name>. Convenience function for
+ * the common symmetric case, equivalent to filter_register_class() followed
+ * by filter_place_class() on FLT_SIDE_GLOBAL, FLT_SIDE_REQ and FLT_SIDE_RES.
+ * Returns 0 on success, -1 on error. */
+int filter_register_class_full(struct filter_class *cls, const char *name,
+			       unsigned int flags,
+			       int (*parse)(char **args, struct proxy *px,
+					    struct filter_instance *inst, char **err),
+			       const char *ref_name, enum flt_pos pos)
+{
+	if (filter_register_class(cls, name, flags, parse) < 0)
+		goto err;
+	if (filter_place_class(cls, FLT_SIDE_GLOBAL, ref_name, pos) < 0)
+		goto cleanup_on_err;
+	if (filter_place_class(cls, FLT_SIDE_REQ, ref_name, pos) < 0)
+		goto cleanup_on_err;
+	if (filter_place_class(cls, FLT_SIDE_RES, ref_name, pos) < 0)
+		goto cleanup_on_err;
+
+	return 0;
+
+  cleanup_on_err:
+	/* detach the class from the class orders and from the registry */
+	flt_unplace_class(cls);
+	LIST_DEL_INIT(&cls->list);
+	/* fallthrough */
+  err:
+	return -1;
+}
+
+/* Init function responsible to initialize all intenral filter classes and to
+ * insert them is global list above. The default evaluation order of all
+ * internal filters is defined in this function. It runs from the prepare stage
+ * so that a class registered by another module from the register stage is
+ * initialized in time: "haproxy -vv" reports the available filter classes from
+ * the argument parsing, which happens between the two.
+ *
+ * Exemple to register a new filter class:
+ *
+ * static struct filter_class flt_myfilter_cls;
+ *
+ * static int myfilter_register_class(void)
+ * {
+ *    if (filter_register_class(&flt_myfilter_cls, "myfilter", FLT_CLS_FL_MULTI, myfilter_parse_def) < 0)
+ *       return -1;
+ *
+ *    // before spoe on request, after lua on response, before cache-store
+ *    // for the global order
+ *     if (filter_place_class(&flt_myfilter_cls, FLT_SIDE_GLOBAL, "cache-store", FLT_POS_BEFORE) < 0)
+ *       return -1;
+ *     if (filter_place_class(&flt_myfilter_cls, FLT_SIDE_REQ, "spoe", FLT_POS_BEFORE) < 0)
+ *       return -1;
+ *    if (filter_place_class(&flt_myfilter_cls, FLT_SIDE_RES, "lua", FLT_POS_AFTER) < 0)
+ *       return -1;
+ *    return 0;
+ * }
+ * INITCALL1(STG_REGISTER, myfilter_register_class);
+ */
+static void filter_init_classes(void)
+{
+	/* TODO: the filter names must come from the filters (the filter id most probably) */
+	flt_init_class(&flt_trace_cls,         trace_filter_cls_name,         FLT_CLS_FL_MULTI, trace_flt_parse_instance);
+	flt_init_class(&flt_cache_store_cls,   cache_store_filter_cls_name,   FLT_CLS_FL_MULTI, cache_store_flt_parse_instance);
+	flt_init_class(&flt_http_comp_req_cls, http_comp_req_filter_cls_name, 0,                http_comp_req_flt_parse_instance);
+	flt_init_class(&flt_http_comp_res_cls, http_comp_res_filter_cls_name, 0,                http_comp_res_flt_parse_instance);
+	flt_init_class(&flt_decomp_req_cls,    decomp_req_filter_cls_name,    0,                decomp_req_flt_parse_instance);
+	flt_init_class(&flt_decomp_res_cls,    decomp_res_filter_cls_name,    0,                decomp_res_flt_parse_instance);
+#if defined(USE_SPOE)
+	flt_init_class(&flt_spoe_cls,          spoe_filter_cls_name,          FLT_CLS_FL_MULTI, spoe_flt_parse_instance);
+#endif
+#if defined(USE_LUA)
+	flt_init_class(&flt_lua_cls,           hlua_filter_cls_name,          FLT_CLS_FL_MULTI, hlua_flt_parse_instance);
+#endif
+	flt_init_class(&flt_bwlim_in_cls,      bwlim_in_filter_cls_name,      FLT_CLS_FL_MULTI, bwlim_in_flt_parse_instance);
+	flt_init_class(&flt_bwlim_out_cls,     bwlim_out_filter_cls_name,     FLT_CLS_FL_MULTI, bwlim_out_flt_parse_instance);
+#if defined(USE_FCGI)
+	flt_init_class(&flt_fcgi_cls,          fcgi_filter_cls_name,          0,                fcgi_flt_parse_instance);
+#endif
+
+	/* Registry: all the known classes, in registration order. It is a flat
+	 * list, and it stays flat whatever the placements are, so that
+	 * filter_find_class() always finds every registered class.
+	 */
+	LIST_APPEND(&filter_classes, &flt_trace_cls.list);
+	LIST_APPEND(&filter_classes, &flt_cache_store_cls.list);
+	LIST_APPEND(&filter_classes, &flt_decomp_req_cls.list);
+	LIST_APPEND(&filter_classes, &flt_decomp_res_cls.list);
+#if defined(USE_SPOE)
+	LIST_APPEND(&filter_classes, &flt_spoe_cls.list);
+#endif
+#if defined(USE_LUA)
+	LIST_APPEND(&filter_classes, &flt_lua_cls.list);
+#endif
+	LIST_APPEND(&filter_classes, &flt_http_comp_req_cls.list);
+	LIST_APPEND(&filter_classes, &flt_http_comp_res_cls.list);
+	LIST_APPEND(&filter_classes, &flt_bwlim_in_cls.list);
+	LIST_APPEND(&filter_classes, &flt_bwlim_out_cls.list);
+#if defined(USE_FCGI)
+	LIST_APPEND(&filter_classes, &flt_fcgi_cls.list);
+#endif
+
+	/* Global order: the same classes, in the global evaluation order. It
+	 * is a placement tree, the classes are re-parented by
+	 * filter_place_class() on FLT_SIDE_GLOBAL.
+	 */
+	LIST_APPEND(&global_filter_classes, &flt_trace_cls.global.list);
+	LIST_APPEND(&global_filter_classes, &flt_decomp_req_cls.global.list);
+	LIST_APPEND(&global_filter_classes, &flt_decomp_res_cls.global.list);
+	LIST_APPEND(&global_filter_classes, &flt_cache_store_cls.global.list);
+#if defined(USE_SPOE)
+	LIST_APPEND(&global_filter_classes, &flt_spoe_cls.global.list);
+#endif
+#if defined(USE_LUA)
+	LIST_APPEND(&global_filter_classes, &flt_lua_cls.global.list);
+#endif
+	LIST_APPEND(&global_filter_classes, &flt_http_comp_req_cls.global.list);
+	LIST_APPEND(&global_filter_classes, &flt_http_comp_res_cls.global.list);
+	LIST_APPEND(&global_filter_classes, &flt_bwlim_in_cls.global.list);
+	LIST_APPEND(&global_filter_classes, &flt_bwlim_out_cls.global.list);
+#if defined(USE_FCGI)
+	LIST_APPEND(&global_filter_classes, &flt_fcgi_cls.global.list);
+#endif
+
+	LIST_APPEND(&req_filter_classes, &flt_trace_cls.req.list);
+	LIST_APPEND(&req_filter_classes, &flt_decomp_req_cls.req.list);
+#if defined(USE_LUA)
+	LIST_APPEND(&req_filter_classes, &flt_lua_cls.req.list);
+#endif
+#if defined(USE_SPOE)
+	LIST_APPEND(&req_filter_classes, &flt_spoe_cls.req.list);
+#endif
+	LIST_APPEND(&req_filter_classes, &flt_http_comp_res_cls.req.list);
+	LIST_APPEND(&req_filter_classes, &flt_decomp_res_cls.req.list);
+	LIST_APPEND(&req_filter_classes, &flt_http_comp_req_cls.req.list);
+	LIST_APPEND(&req_filter_classes, &flt_bwlim_in_cls.req.list);
+#if defined(USE_FCGI)
+	LIST_APPEND(&req_filter_classes, &flt_fcgi_cls.req.list);
+#endif
+
+#if defined(USE_FCGI)
+	LIST_APPEND(&res_filter_classes, &flt_fcgi_cls.res.list);
+#endif
+	LIST_APPEND(&res_filter_classes, &flt_trace_cls.res.list);
+	LIST_APPEND(&res_filter_classes, &flt_decomp_res_cls.res.list);
+	LIST_APPEND(&res_filter_classes, &flt_cache_store_cls.res.list);
+#if defined(USE_SPOE)
+	LIST_APPEND(&res_filter_classes, &flt_spoe_cls.res.list);
+#endif
+#if defined(USE_LUA)
+	LIST_APPEND(&res_filter_classes, &flt_lua_cls.res.list);
+#endif
+	LIST_APPEND(&res_filter_classes, &flt_http_comp_res_cls.res.list);
+	LIST_APPEND(&res_filter_classes, &flt_decomp_req_cls.res.list);
+	LIST_APPEND(&res_filter_classes, &flt_bwlim_out_cls.res.list);
+
+	filter_classes_initialized = 1;
+}
+
+
+
+REGISTER_PRE_CHECK(flt_precheck_classes);
+REGISTER_POST_PROXY_CHECK(flt_check_instances);
+REGISTER_POST_CHECK(flt_init_all);
+REGISTER_PER_THREAD_INIT(flt_init_all_per_thread);
+REGISTER_PER_THREAD_DEINIT(flt_deinit_all_per_thread);
+
+INITCALL0(STG_PREPARE, filter_init_classes);
+
+/*
+ * Local variables:
+ *  c-indent-level: 8
+ *  c-basic-offset: 8
+ * End:
+ */

@@ -1,0 +1,64 @@
+name: 'setup VTest'
+description: 'ssss'
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: Setup coredumps
+      if: ${{ runner.os == 'Linux' }}
+      shell: sh
+      run: |
+        sudo mkdir -p /tmp/core
+        sudo sysctl fs.suid_dumpable=1
+        sudo sysctl kernel.core_pattern=/tmp/core/core.%h.%e.%t
+
+    - name: Setup ulimit for core dumps
+      shell: sh
+      run: |
+        # This is required for macOS which does not actually allow to increase
+        # the '-n' soft limit to the hard limit, thus failing to run.
+        ulimit -n 65536
+        ulimit -c unlimited
+
+    - name: Get the build environment ID
+      id: env-id
+      shell: sh
+      run: |
+        environment_id=$( (. /etc/os-release 2>/dev/null && echo "${ID:-unknown}${VERSION_ID:+-${VERSION_ID}}") || uname -s )
+        echo "id=${environment_id}" >> "$GITHUB_OUTPUT"
+
+    - name: Get VTest latest commit SHA
+      id: vtest-sha
+      shell: sh
+      run: |
+        echo "sha=$(git ls-remote https://code.vinyl-cache.org/vtest/VTest2 HEAD | cut -f1)" >> $GITHUB_OUTPUT
+
+    - name: Restore VTest cache
+      id: cache-vtest
+      uses: actions/cache/restore@v5
+      with:
+        path: vtest
+        key: vtest-${{ runner.os }}-${{ runner.arch }}-${{ steps.env-id.outputs.id }}-${{ steps.vtest-sha.outputs.sha }}
+
+    - name: Install VTest
+      if: ${{ steps.cache-vtest.outputs.cache-hit != 'true' }}
+      shell: sh
+      run: |
+        # Use the runtime workspace, not the host-side github.workspace path.
+        DESTDIR="$GITHUB_WORKSPACE/vtest" scripts/build-vtest.sh
+
+    - name: Save VTest cache
+      if: ${{ steps.cache-vtest.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v5
+      with:
+        path: vtest
+        key: ${{ steps.cache-vtest.outputs.cache-primary-key }}
+
+    - name: Install problem matcher for VTest
+      shell: sh
+      # This allows one to more easily see which tests fail.
+      run: echo "::add-matcher::.github/vtest.json"
+
+
+

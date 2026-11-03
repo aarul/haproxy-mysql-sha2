@@ -1,0 +1,382 @@
+/*
+ * include/haproxy/filters.h
+ * This file defines function prototypes for stream filters management.
+ *
+ * Copyright (C) 2015 Qualys Inc., Christopher Faulet <cfaulet@qualys.com>
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
+#ifndef _HAPROXY_FILTERS_H
+#define _HAPROXY_FILTERS_H
+
+#include <haproxy/channel.h>
+#include <haproxy/filters-t.h>
+#include <haproxy/http_ana-t.h>
+#include <haproxy/proxy-t.h>
+#include <haproxy/stream-t.h>
+
+extern const char *trace_flt_id;
+extern const char *http_comp_req_flt_id;
+extern const char *http_comp_res_flt_id;
+extern const char *decomp_req_flt_id;
+extern const char *decomp_res_flt_id;
+extern const char *cache_store_flt_id;
+
+extern const char *trace_filter_cls_name;
+extern const char *cache_store_filter_cls_name;
+extern const char *http_comp_req_filter_cls_name;
+extern const char *http_comp_res_filter_cls_name;
+extern const char *decomp_req_filter_cls_name;
+extern const char *decomp_res_filter_cls_name;
+extern const char *bwlim_in_filter_cls_name;
+extern const char *bwlim_out_filter_cls_name;
+
+extern struct filter_class flt_trace_cls;
+extern struct filter_class flt_cache_store_cls;
+extern struct filter_class flt_http_comp_req_cls;
+extern struct filter_class flt_http_comp_res_cls;
+extern struct filter_class flt_decomp_req_cls;
+extern struct filter_class flt_decomp_res_cls;
+extern struct filter_class flt_bwlim_in_cls;
+extern struct filter_class flt_bwlim_out_cls;
+
+#if defined(USE_SPOE)
+extern const char *spoe_filter_id;
+extern const char *spoe_filter_cls_name;
+extern struct filter_class flt_spoe_cls;
+#endif
+#if defined(USE_LUA)
+extern const char *hlua_filter_cls_name;
+extern struct filter_class flt_lua_cls;
+#endif
+#if defined(USE_FCGI)
+extern const char *fcgi_flt_id;
+extern const char *fcgi_filter_cls_name;
+extern struct filter_class flt_fcgi_cls;
+#endif
+
+/* Parsing functions of the internal filter classes, called to finalize a
+ * filter instance (see "filter-config" directive)
+ */
+int trace_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+int cache_store_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+int http_comp_req_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+int http_comp_res_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+int decomp_req_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+int decomp_res_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+#if defined(USE_LUA)
+int hlua_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+#endif
+#if defined(USE_SPOE)
+int spoe_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+#endif
+int bwlim_in_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+int bwlim_out_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+#if defined(USE_FCGI)
+int fcgi_flt_parse_instance(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+#endif
+
+#define FLT_ID(flt)   (flt)->config->id
+#define FLT_CONF(flt) (flt)->config->conf
+#define FLT_OPS(flt)  (flt)->config->ops
+
+/* Useful macros to access per-channel values. It can be safely used inside
+ * filters. */
+#define CHN_IDX(chn)     (((chn)->flags & CF_ISRESP) == CF_ISRESP)
+#define FLT_STRM_OFF(s, chn) (chn->flt.offset)
+#define FLT_OFF(flt, chn) ((flt)->offset[CHN_IDX(chn)])
+
+#define HAS_FILTERS(strm)           ((strm)->strm_flt.flags & STRM_FLT_FL_HAS_FILTERS)
+
+#define HAS_REQ_DATA_FILTERS(strm)  ((strm)->req.flt.nb_data_filters != 0)
+#define HAS_RSP_DATA_FILTERS(strm)  ((strm)->res.flt.nb_data_filters != 0)
+#define HAS_DATA_FILTERS(strm, chn) (((chn)->flags & CF_ISRESP) ? HAS_RSP_DATA_FILTERS(strm) : HAS_REQ_DATA_FILTERS(strm))
+
+#define IS_REQ_DATA_FILTER(flt)  ((flt)->flags & FLT_FL_IS_REQ_DATA_FILTER)
+#define IS_RSP_DATA_FILTER(flt)  ((flt)->flags & FLT_FL_IS_RSP_DATA_FILTER)
+#define IS_DATA_FILTER(flt, chn) (((chn)->flags & CF_ISRESP) ? IS_RSP_DATA_FILTER(flt) : IS_REQ_DATA_FILTER(flt))
+
+#define FLT_STRM_CB(strm, call)						\
+	do {								\
+		if (HAS_FILTERS(strm)) { call; }			\
+	} while (0)
+
+#define FLT_STRM_DATA_CB_IMPL_1(strm, chn, call, default_ret)	        \
+	(HAS_DATA_FILTERS(strm, chn) ? call : default_ret)
+#define FLT_STRM_DATA_CB_IMPL_2(strm, chn, call, default_ret, on_error)	\
+	({								\
+		int _ret;						\
+		if (HAS_DATA_FILTERS(strm, chn)) {			\
+			_ret = call;					\
+			if (_ret < 0) { on_error; }			\
+		}							\
+		else							\
+			_ret = default_ret;				\
+		_ret;							\
+	})
+#define FLT_STRM_DATA_CB_IMPL_3(strm, chn, call, default_ret, on_error, on_wait) \
+	({								\
+		int _ret;						\
+		if (HAS_DATA_FILTERS(strm, chn)) {			\
+			_ret = call;					\
+			if (_ret < 0) { on_error; }			\
+			if (!_ret)    { on_wait;  }			\
+		}							\
+		else							\
+			_ret = default_ret;				\
+		_ret;							\
+	})
+
+#define FLT_STRM_DATA_CB_IMPL_X(strm, chn, call, A, B, C, DATA_CB_IMPL, ...) \
+	DATA_CB_IMPL
+
+#define FLT_STRM_DATA_CB(strm, chn, call, ...)				\
+	FLT_STRM_DATA_CB_IMPL_X(strm, chn, call, ##__VA_ARGS__,		\
+				FLT_STRM_DATA_CB_IMPL_3(strm, chn, call, ##__VA_ARGS__), \
+				FLT_STRM_DATA_CB_IMPL_2(strm, chn, call, ##__VA_ARGS__), \
+				FLT_STRM_DATA_CB_IMPL_1(strm, chn, call, ##__VA_ARGS__))
+
+void flt_deinit(struct proxy *p);
+int  flt_check(struct proxy *p);
+
+int  flt_preinit_instances_all(void);
+int  flt_has_explicit_config(const struct proxy *px);
+int  flt_copy_instances(struct proxy *px, const struct proxy *defpx);
+void flt_free_instances(struct proxy *px);
+
+int  flt_start_new_proxy(struct proxy *px);
+int  flt_init_new_proxy(struct proxy *px);
+void flt_deinit_new_proxy(struct proxy *px);
+
+int  flt_init_class_refs(struct proxy *px);
+int  flt_add_implicit_instance(struct proxy *px, struct filter_class *cls, const char *id,
+				 char **args, const char *file, int line);
+struct filter_instance *flt_find_instance(struct proxy *px, struct filter_class *cls, const char *id);
+
+int flt_foreach_conf(struct proxy *px, unsigned int side,
+		     int (*fct)(struct flt_conf *fconf, void *data), void *data);
+struct flt_conf *flt_find_conf(struct proxy *px, const char *flt_id, unsigned int side,
+			       int (*match)(struct flt_conf *fconf, void *data), void *data);
+struct flt_conf *flt_find_legacy_conf(struct proxy *px, const char *flt_id,
+				      int (*match)(struct flt_conf *fconf, void *data), void *data);
+
+int  flt_stream_start(struct stream *s);
+void flt_stream_stop(struct stream *s);
+int  flt_set_stream_backend(struct stream *s, struct proxy *be);
+int  flt_stream_init(struct stream *s);
+void flt_stream_release(struct stream *s, int only_backend);
+void flt_stream_check_timeouts(struct stream *s);
+
+int  flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len);
+int  flt_http_end(struct stream *s, struct http_msg *msg);
+
+void flt_http_reset(struct stream *s, struct http_msg *msg);
+void flt_http_reply(struct stream *s, short status, const struct buffer *msg);
+
+int  flt_start_analyze(struct stream *s, struct channel *chn, unsigned int an_bit);
+int  flt_pre_analyze(struct stream *s, struct channel *chn, unsigned int an_bit);
+int  flt_post_analyze(struct stream *s, struct channel *chn, unsigned int an_bit);
+int  flt_analyze_http_headers(struct stream *s, struct channel *chn, unsigned int an_bit);
+int  flt_end_analyze(struct stream *s, struct channel *chn, unsigned int an_bit);
+
+int  flt_xfer_data(struct stream *s, struct channel *chn, unsigned int an_bit);
+
+void           flt_register_keywords(struct flt_kw_list *kwl);
+struct flt_kw *flt_find_kw(const char *kw);
+void           flt_dump_kws(char **out);
+void           list_filter_classes(FILE *out);
+
+int flt_has_filter(const struct proxy *px);
+
+/* Returns != 0 if the proxy <px> is in legacy filter mode, so when an explicit
+ * legacy "filter" directive was used (PR_FL_FILTER_LEGACY). In legacy mode, the
+ * filter configurations are in px->filter_configs; otherwise they come from the
+ * filter instances (px->filter_instances and the flat per-side lists).
+ */
+static inline int flt_use_legacy_filter(const struct proxy *px)
+{
+	return px->flags & PR_FL_FILTER_LEGACY;
+}
+
+/* Appends the legacy filter config <fconf> to the three configuration
+ * lists of the proxy <px>: the global order and the request and response
+ * orders, in declaration order. flt_check() later reorders the three
+ * lists with flt_reorder_implicit_conf(). The 'list', 'by_req' and
+ * 'by_res' members of <fconf> must not be linked yet.
+ */
+static inline void flt_conf_add(struct proxy *px, struct flt_conf *fconf)
+{
+	LIST_APPEND(&px->filter_configs, &fconf->list);
+	LIST_APPEND(&px->filters_req_configs, &fconf->by_req);
+	LIST_APPEND(&px->filters_res_configs, &fconf->by_res);
+}
+
+/* Same as flt_conf_add() but inserts <fconf> at the beginning of the
+ * three configuration lists of the proxy <px>.
+ */
+static inline void flt_conf_insert(struct proxy *px, struct flt_conf *fconf)
+{
+	LIST_INSERT(&px->filter_configs, &fconf->list);
+	LIST_INSERT(&px->filters_req_configs, &fconf->by_req);
+	LIST_INSERT(&px->filters_res_configs, &fconf->by_res);
+}
+
+/* Removes the legacy filter config <fconf> from the three configuration
+ * lists.*/
+static inline void flt_conf_delete(struct flt_conf *fconf)
+{
+	LIST_DELETE(&fconf->list);
+	LIST_DELETE(&fconf->by_req);
+	LIST_DELETE(&fconf->by_res);
+}
+
+/* Helper function that returns the "global" state of filters attached to a
+ * stream. */
+static inline struct strm_flt *
+strm_flt(struct stream *s)
+{
+	return &s->strm_flt;
+}
+
+/* Registers a filter to a channel. If a filter was already registered, this
+ * function do nothing. Once registered, the filter becomes a "data" filter for
+ * this channel. */
+static inline void
+register_data_filter(struct stream *s, struct channel *chn, struct filter *filter)
+{
+	if (!IS_DATA_FILTER(filter, chn)) {
+		if (chn->flags & CF_ISRESP)
+			filter->flags |= FLT_FL_IS_RSP_DATA_FILTER;
+		else
+			filter->flags |= FLT_FL_IS_REQ_DATA_FILTER;
+		chn->flt.nb_data_filters++;
+	}
+}
+
+/* Unregisters a "data" filter from a channel. */
+static inline void
+unregister_data_filter(struct stream *s, struct channel *chn, struct filter *filter)
+{
+	if (IS_DATA_FILTER(filter, chn)) {
+		if (chn->flags & CF_ISRESP)
+			filter->flags &= ~FLT_FL_IS_RSP_DATA_FILTER;
+		else
+			filter->flags &= ~FLT_FL_IS_REQ_DATA_FILTER;
+		chn->flt.nb_data_filters--;
+	}
+}
+
+/*
+ * flt_list_start() and flt_list_next() can be used to iterate over the list of filters
+ * for a given <strm> and <chn> combination. It will automatically choose the proper
+ * list to iterate from depending on the context.
+ *
+ * flt_list_start() has to be called exactly once to get the first value from the list
+ * to get the following values, use flt_list_next() until NULL is returned.
+ *
+ * Example:
+ *
+ *    struct filter *filter;
+ *
+ *    for (filter = flt_list_start(stream, channel); filter;
+ *         filter = flt_list_next(stream, channel, filter)) {
+ *	...
+ *    }
+ */
+static inline struct filter *flt_list_start(struct stream *strm, struct channel *chn)
+{
+	struct filter *filter;
+
+	if (chn->flags & CF_ISRESP) {
+		filter = LIST_NEXT(&chn->flt.filters, struct filter *, res_list);
+		if (&filter->res_list == &chn->flt.filters)
+			filter = NULL; /* empty list */
+	}
+	else {
+		filter = LIST_NEXT(&chn->flt.filters, struct filter *, req_list);
+		if (&filter->req_list == &chn->flt.filters)
+			filter = NULL; /* empty list */
+	}
+
+	return filter;
+}
+
+static inline struct filter *flt_list_next(struct stream *strm, struct channel *chn,
+                                           struct filter *filter)
+{
+	if (chn->flags & CF_ISRESP) {
+		filter = LIST_NEXT(&filter->res_list, struct filter *, res_list);
+		if (&filter->res_list == &chn->flt.filters)
+			filter = NULL; /* end of list */
+	}
+	else {
+		filter = LIST_NEXT(&filter->req_list, struct filter *, req_list);
+		if (&filter->req_list == &chn->flt.filters)
+			filter = NULL; /* end of list */
+	}
+
+	return filter;
+}
+
+/* This function must be called when a filter alter payload data. It updates
+ * offsets of all previous filters. Do not call this function when a filter
+ * change the size of payload data leads to an undefined behavior.
+ *
+ * This is the filter's responsiblitiy to update data itself.
+ */
+static inline void
+flt_update_offsets(struct filter *filter, struct channel *chn, int len)
+{
+	struct stream *s = chn_strm(chn);
+	struct filter *f;
+
+	for (f = flt_list_start(s, chn); f;
+	     f = flt_list_next(s, chn, f)) {
+		if (f == filter)
+			break;
+		FLT_OFF(f, chn) += len;
+	}
+}
+
+
+/**************************************************************/
+
+struct filter_class *filter_find_class(const char *name);
+
+/* Helper function for filter classes: calls the legacy "filter" keyword
+ * parsing function <parse> on the arguments of the filter instance <inst>,
+ * as if the line "filter <kw> <inst args...>" was found in the configuration
+ * of the proxy <px>. <private> is passed as-is to the parsing function.
+ * Returns 0 on success, < 0 on error.
+ */
+int flt_parse_instance_legacy(struct proxy *px, struct filter_instance *inst, char **err,
+			 const char *kw,
+			 int (*parse)(char **args, int *cur_arg, struct proxy *px,
+				      struct flt_conf *fconf, char **err, void *private),
+			 void *private);
+
+int filter_register_class(struct filter_class *cls, const char *name,
+			  unsigned int flags,
+			  int (*parse)(char **args, struct proxy *px,
+				       struct filter_instance *inst, char **err));
+int filter_place_class(struct filter_class *cls, unsigned int side,
+		       const char *ref_name, enum flt_pos pos);
+int filter_register_class_full(struct filter_class *cls, const char *name,
+			       unsigned int flags,
+			       int (*parse)(char **args, struct proxy *px,
+					    struct filter_instance *inst, char **err),
+			       const char *ref_name, enum flt_pos pos);
+
+#endif /* _HAPROXY_FILTERS_H */

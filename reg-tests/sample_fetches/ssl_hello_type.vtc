@@ -1,0 +1,191 @@
+varnishtest "Test the raw TLS hello fetches of the TCP rule sets"
+
+# req.ssl_hello_type, req.ssl_ver, req.ssl_ec_ext, req.ssl_st_ext and
+# res.ssl_hello_type had no coverage, nor had the deprecated
+# req_ssl_hello_type, req_ssl_ver, req_ssl_sni and rep_ssl_hello_type
+# aliases. They all parse the raw buffer of a TCP proxy, without any SSL
+# data layer, so the handshake messages are crafted by hand here.
+#
+# The second frontend covers the other format req.ssl_ver understands,
+# the SSLv2 CLIENT-HELLO, which none of the other fetches parses, and
+# the dotted notation their ACLs accept as a pattern.
+
+feature ignore_unknown_macro
+
+# Every ClientHello is answered with the same ServerHello, but each of
+# them gets its own server so that the whole message is read: a server
+# closing its socket while a few bytes are still unread makes the system
+# emit a reset, which discards the ServerHello when haproxy has not read
+# it yet. That used to make this test fail from time to time when the
+# suite was run in parallel. The three connections reach the three
+# servers in order thanks to the round robin of the backend.
+server s1 {
+	recv 90
+	sendhex "16030300 2c 02000028 0303 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 00 1302 00 0000"
+} -start
+
+server s2 {
+	recv 60
+	sendhex "16030300 2c 02000028 0303 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 00 1302 00 0000"
+} -start
+
+server s3 {
+	recv 57
+	sendhex "16030300 2c 02000028 0303 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 00 1302 00 0000"
+} -start
+
+# One syslog server per frontend: the log of a stream is emitted when the
+# stream ends, which may happen after the next client has been served by
+# the other frontend, so the two series are only ordered on their own.
+syslog S1 -level info {
+	# supported_groups and an empty session ticket extension
+	recv
+	expect ~ "type=1 ver=196611 ec=1 st=1 sni=www.example.com dtype=1 dver=196611 dsni=www.example.com rtype=2 drtype=2 bytes=[0-9]+$"
+	# a session ticket carrying data, and no supported_groups
+	recv
+	expect ~ "type=1 ver=196611 ec=0 st=2 sni=- dtype=1 dver=196611 dsni=- rtype=2 drtype=2 bytes=[0-9]+$"
+	# one unrelated extension: no supported_groups and no session ticket
+	recv
+	expect ~ "type=1 ver=196611 ec=0 st=0 sni=- dtype=1 dver=196611 dsni=- rtype=2 drtype=2 bytes=[0-9]+$"
+} -start
+
+syslog S2 -level info {
+	# an SSLv2 CLIENT-HELLO announcing SSLv3.0, short record header
+	recv
+	expect ~ "sslv2 ver=196608 dver=196608 type=- sni=- eq30=1 gt30=-$"
+	# an SSLv2 CLIENT-HELLO announcing TLSv1.0, long record header
+	recv
+	expect ~ "sslv2 ver=196609 dver=196609 type=- sni=- eq30=- gt30=1$"
+	# not SSL at all
+	recv
+	expect ~ "sslv2 ver=- dver=- type=- sni=- eq30=- gt30=-$"
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+        chroot /
+	nbthread 1
+
+    defaults
+	mode tcp
+	timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+	timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+	timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe1
+	bind "fd@${fe1}"
+	log ${S1_addr}:${S1_port} local0
+	# %B is only there to delay the message until the response rules
+	# have run
+	log-format "type=%[var(txn.t)] ver=%[var(txn.v)] ec=%[var(txn.e)] st=%[var(txn.s)] sni=%[var(txn.n)] dtype=%[var(txn.dt)] dver=%[var(txn.dv)] dsni=%[var(txn.dn)] rtype=%[var(txn.rt)] drtype=%[var(txn.drt)] bytes=%B"
+
+	tcp-request inspect-delay 100ms
+	tcp-request content set-var(txn.t)  req.ssl_hello_type
+	tcp-request content set-var(txn.v)  req.ssl_ver
+	tcp-request content set-var(txn.e)  req.ssl_ec_ext
+	tcp-request content set-var(txn.s)  req.ssl_st_ext
+	tcp-request content set-var(txn.n)  req.ssl_sni
+	# the deprecated spellings must report the same values
+	tcp-request content set-var(txn.dt) req_ssl_hello_type
+	tcp-request content set-var(txn.dv) req_ssl_ver
+	tcp-request content set-var(txn.dn) req_ssl_sni
+	tcp-request content accept if { req.ssl_hello_type 1 }
+
+	default_backend be
+
+    # req.ssl_ver is the only one of the family which also parses the
+    # SSLv2 CLIENT-HELLO record format, where the version is not at the
+    # same place at all. This frontend rejects everything, the fetches
+    # are only reported in the log.
+    frontend fe2
+	bind "fd@${fe2}"
+	log ${S2_addr}:${S2_port} local0
+	log-format "sslv2 ver=%[var(txn.v)] dver=%[var(txn.dv)] type=%[var(txn.t)] sni=%[var(txn.n)] eq30=%[var(txn.eq)] gt30=%[var(txn.gt)]"
+
+	tcp-request inspect-delay 100ms
+	tcp-request content set-var(txn.v)  req.ssl_ver
+	tcp-request content set-var(txn.dv) req_ssl_ver
+	tcp-request content set-var(txn.t)  req.ssl_hello_type
+	tcp-request content set-var(txn.n)  req.ssl_sni
+	# both spellings of the ACL parse their pattern in dotted notation
+	tcp-request content set-var(txn.eq) int(1) if { req.ssl_ver 3.0 }
+	tcp-request content set-var(txn.gt) int(1) if { req_ssl_ver gt 3.0 }
+	tcp-request content reject
+
+    backend be
+	tcp-response inspect-delay 100ms
+	tcp-response content set-var(txn.rt)  res.ssl_hello_type
+	tcp-response content set-var(txn.drt) rep_ssl_hello_type
+	tcp-response content accept if { res.ssl_hello_type 2 }
+	balance roundrobin
+	server s1 ${s1_addr}:${s1_port}
+	server s2 ${s2_addr}:${s2_port}
+	server s3 ${s3_addr}:${s3_port}
+} -start
+
+# The ClientHellos share the 43-byte body of the other ClientHello tests:
+#   16 03 01 LL LL    TLS record: handshake, TLSv1.0
+#   01 00 00 LL       Handshake: ClientHello
+#   03 03             client_version, TLSv1.2
+#   00 .. 1f          Random[32]
+#   00                session_id_len = 0
+#   00 02 13 02       cipher_len = 2, one cipher suite
+#   01 00             compression_len = 1, method 0
+#   LL LL             extensions_len
+# and only differ by the extensions which follow.
+
+# server_name, supported_groups and an empty session_ticket (0023)
+client c1 -connect ${h1_fe1_sock} {
+	sendhex "160301 0055 01000051 0303 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 00 00021302 0100 0026 00000014001200000f 7777772e6578616d706c652e636f6d 000a00060004001d0017 00230000"
+	recv 49
+	expect_close
+} -run
+
+# a session_ticket holding four bytes, and no supported_groups
+client c2 -connect ${h1_fe1_sock} {
+	sendhex "160301 0037 01000033 0303 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 00 00021302 0100 0008 0023 0004 aabbccdd"
+	recv 49
+	expect_close
+} -run
+
+# a single unrelated extension (renegotiation_info). Note that an empty
+# extension block is not accepted by the parser, which requires at least
+# two bytes past the extension list length.
+client c3 -connect ${h1_fe1_sock} {
+	sendhex "160301 0034 01000030 0303 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 00 00021302 0100 0005 ff01000100"
+	recv 49
+	expect_close
+} -run
+
+# SSLv2 CLIENT-HELLO with the short record header:
+#   80 1c                 length = 28, no padding
+#   01                    msg_type = CLIENT-HELLO
+#   03 00                 version = SSLv3.0
+#   00 03                 cipher_len, a multiple of 3
+#   00 00                 session_id_len, 0 or 16
+#   00 10                 challenge_len, 16 to 32
+#   010080                one cipher
+#   11 .. 20              challenge[16]
+client c4 -connect ${h1_fe2_sock} {
+	sendhex "801c 01 0300 0003 0000 0010 010080 1112131415161718191a1b1c1d1e1f20"
+	expect_close
+} -run
+
+# same with the long record header, which carries a padding length, two
+# ciphers, a 32-byte challenge and announces TLSv1.0
+client c5 -connect ${h1_fe2_sock} {
+	sendhex "002f 02 01 0301 0006 0000 0020 010080020080 1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30 aabb"
+	expect_close
+} -run
+
+# a plain HTTP request is neither an SSLv3 record nor an SSLv2 hello
+client c6 -connect ${h1_fe2_sock} {
+	send "GET / HTTP/1.0\r\n\r\n"
+	expect_close
+} -run
+
+syslog S1 -wait
+syslog S2 -wait

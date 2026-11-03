@@ -1,0 +1,377 @@
+/*
+ * include/haproxy/filters-t.h
+ * This file defines everything related to stream filters.
+ *
+ * Copyright (C) 2015 Qualys Inc., Christopher Faulet <cfaulet@qualys.com>
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
+#ifndef _HAPROXY_FILTERS_T_H
+#define _HAPROXY_FILTERS_T_H
+
+#include <haproxy/api-t.h>
+#include <haproxy/buf-t.h>
+
+/* Flags set on a filter config */
+#define FLT_CFG_FL_HTX    0x00000001  /* The filter can filter HTX streams */
+#define FLT_CFG_FL_EXPLICIT 0x00000002 /* Explicitly declared with the legacy "filter" directive */
+
+/* Flags set on a stream filter instance */
+#define FLT_FL_IS_BACKEND_FILTER  0x0001 /* The filter is a backend filter */
+#define FLT_FL_IS_REQ_DATA_FILTER 0x0002 /* The filter will parse data on the request channel */
+#define FLT_FL_IS_RSP_DATA_FILTER 0x0004 /* The filter will parse data on the response channel */
+
+/* Flags set on the stream, common to all filters attached to its stream */
+#define STRM_FLT_FL_HAS_FILTERS          0x0001 /* The stream has at least one filter */
+#define STRM_FLT_FL_HOLD_HTTP_HDRS       0x0002 /* At least one filter on the stream want to hold the message headers */
+
+
+struct http_msg;
+struct proxy;
+struct stream;
+struct channel;
+struct flt_conf;
+struct filter;
+struct filter_class_ref;
+struct filter_instance;
+
+/* Descriptor for a "filter" keyword. The ->parse() function returns 0 in case
+ * of success, or a combination of ERR_* flags if an error is encountered. The
+ * function pointer can be NULL if not implemented.
+ */
+struct flt_kw {
+	const char *kw;
+	int (*parse)(char **args, int *cur_arg, struct proxy *px,
+		     struct flt_conf *fconf, char **err, void *private);
+	void *private;
+};
+
+/*
+ * A keyword list. It is a NULL-terminated array of keywords. It embeds a struct
+ * list in order to be linked to other lists, allowing it to easily be declared
+ * where it is needed, and linked without duplicating data nor allocating
+ * memory. It is also possible to indicate a scope for the keywords.
+ */
+struct flt_kw_list {
+	const char *scope;
+	struct list list;
+	struct flt_kw kw[VAR_ARRAY];
+};
+
+/*
+ * Callbacks available on a filter:
+ *
+ *  - init                : Initializes the filter for a proxy. Returns a
+ *                          negative value if an error occurs.
+ *  - deinit              : Cleans up what the init function has done.
+ *  - check               : Check the filter config for a proxy. Returns the
+ *                          number of errors encountered.
+ * - init_per_thread      : Initializes the filter for a proxy for a specific
+ *                          thread. Returns a negative value if an error
+ *                          occurs.
+ * - deinit_per_thread    : Cleans up what the init_per_thread function has
+ *                          done.
+ *
+ *
+ *  - attach              : Called after a stream filter instance creation, when it is
+ *                          attached to a stream. This happens when the stream
+ *                          is started for filters defined on the stream's
+ *                          frontend and when the backend is set for filters
+ *                          declared on the stream's backend.
+ *                          Returns a negative value if an error occurs, 0 if
+ *                          the filter must be ignored for the stream, any other
+ *                          value otherwise.
+ *  - stream_start        : Called when a stream is started. This callback will
+ *                          only be called for filters defined on the stream's
+ *                          frontend.
+ *                          Returns a negative value if an error occurs, any
+ *                          other value otherwise.
+ *  - stream_set_backend  : Called when a backend is set for a stream. This
+ *                          callbacks will be called for all filters attached
+ *                          to a stream (frontend and backend).
+ *                          Returns a negative value if an error occurs, any
+ *                          other value otherwise.
+ *  - stream_stop         : Called when a stream is stopped. This callback will
+ *                          only be called for filters defined on the stream's
+ *                          frontend.
+ *  - detach              : Called when a stream filter instance is detached from a
+ *                          stream, before its destruction. This happens when
+ *                          the stream is stopped for filters defined on the
+ *                          stream's frontend and when the analyze ends for
+ *                          filters defined on the stream's backend.
+ *  - check_timeouts      : Called when a a stream is woken up because of an
+ *                          expired timer.
+ *
+ *
+ *  - channel_start_analyze: Called when a filter starts to analyze a channel.
+ *                          Returns a negative value if an error occurs, 0 if
+ *                          it needs to wait, any other value otherwise.
+ *  - channel_pre_analyze : Called before each analyzer attached to a channel,
+ *                          expects analyzers responsible for data sending.
+ *                          Returns a negative value if an error occurs, 0 if
+ *                          it needs to wait, any other value otherwise.
+ *  - channel_post_analyze: Called after each analyzer attached to a channel,
+ *                          expects analyzers responsible for data sending.
+ *                          Returns a negative value if an error occurs,
+ *                          any other value otherwise.
+ *  - channel_end_analyze : Called when all other analyzers have finished their
+ *                          processing.
+ *                          Returns a negative value if an error occurs, 0 if
+ *                          it needs to wait, any other value otherwise.
+ *
+ *
+ *  - http_headers        : Called before the body parsing, after all HTTP
+ *                          headers was parsed and analyzed.
+ *                          Returns a negative value if an error occurs, 0 if
+ *                          it needs to wait, any other value otherwise.
+ *  - http_payload        : Called when some data can be consumed.
+ *                          Returns a negative value if an error occurs, else
+ *                          the number of forwarded bytes.
+ *  - http_end            : Called when all the request/response has been
+ *                          processed and all body data has been forwarded.
+ *                          Returns a negative value if an error occurs, 0 if
+ *                          it needs to wait for some reason, any other value
+ *                          otherwise.
+ *  - http_reset          : Called when the HTTP message is reset. It happens
+ *                          either when a 100-continue response is received.
+ *                          that can be detected if s->txn.http->status is 10X, or
+ *                          if we're attempting a L7 retry.
+ *                          Returns nothing.
+ *  - http_reply          : Called when, at any time, HAProxy decides to stop
+ *                          the HTTP message's processing and to send a message
+ *                          to the client (mainly, when an error or a redirect
+ *                          occur).
+ *                          Returns nothing.
+ *
+ *
+ *  - tcp_payload         : Called when some data can be consumed.
+ *                          Returns a negative value if an error occurs, else
+ *                          the number of forwarded bytes.
+ */
+struct flt_ops {
+	/*
+	 * Callbacks to manage the filter lifecycle
+	 */
+	int  (*init)             (struct proxy *p, struct flt_conf *fconf);
+	void (*deinit)           (struct proxy *p, struct flt_conf *fconf);
+	int  (*check)            (struct proxy *p, struct flt_conf *fconf);
+	int  (*init_per_thread)  (struct proxy *p, struct flt_conf *fconf);
+	void (*deinit_per_thread)(struct proxy *p, struct flt_conf *fconf);
+	/*
+	 * Stream callbacks
+	 */
+	int  (*attach)            (struct stream *s, struct filter *f);
+	int  (*stream_start)      (struct stream *s, struct filter *f);
+	int  (*stream_set_backend)(struct stream *s, struct filter *f, struct proxy *be);
+	void (*stream_stop)       (struct stream *s, struct filter *f);
+	void (*detach)            (struct stream *s, struct filter *f);
+	void (*check_timeouts)    (struct stream *s, struct filter *f);
+	/*
+	 * Channel callbacks
+	 */
+	int  (*channel_start_analyze)(struct stream *s, struct filter *f, struct channel *chn);
+	int  (*channel_pre_analyze)  (struct stream *s, struct filter *f, struct channel *chn, unsigned int an_bit);
+	int  (*channel_post_analyze) (struct stream *s, struct filter *f, struct channel *chn, unsigned int an_bit);
+	int  (*channel_end_analyze)  (struct stream *s, struct filter *f, struct channel *chn);
+
+	/*
+	 * HTTP callbacks
+	 */
+	int  (*http_headers)       (struct stream *s, struct filter *f, struct http_msg *msg);
+	int  (*http_payload)       (struct stream *s, struct filter *f, struct http_msg *msg,
+				    unsigned int offset, unsigned int len);
+	int  (*http_end)           (struct stream *s, struct filter *f, struct http_msg *msg);
+
+	void (*http_reset)         (struct stream *s, struct filter *f, struct http_msg *msg);
+	void (*http_reply)         (struct stream *s, struct filter *f, short status,
+				    const struct buffer *msg);
+
+	/*
+	 * TCP callbacks
+	 */
+	int  (*tcp_payload)       (struct stream *s, struct filter *f, struct channel *chn,
+				    unsigned int offset, unsigned int len);
+};
+
+/*
+ * Structure representing the filter configuration, attached to a proxy and
+ * accessible from a filter when instantiated in a stream
+ */
+struct flt_conf {
+	const char     *name;   /* The filter name (same name used to select the filter from config) */
+	const char     *id;     /* The filter id */
+	struct flt_ops *ops;    /* The filter callbacks */
+	void           *conf;   /* The filter configuration */
+	unsigned int    flags;  /* FLT_CFG_FL_* */
+	struct list     list;   /* Next filter for the same proxy */
+	struct list     by_req; /* Link in the list of filter to eval on the requet path */
+	struct list     by_res; /* Link in the list of filter to eval on the response path */
+};
+
+/*
+ * Structure representing a stream filter instance attached to a stream
+ *
+ * 2D-Array fields are used to store info per channel. The first index stands
+ * for the request channel, and the second one for the response channel.
+ * Especially, <next> and <fwd> are offsets representing amount of data that the
+ * filter are, respectively, parsed and forwarded on a channel. Filters can
+ * access these values using FLT_NXT and FLT_FWD macros.
+ */
+struct filter {
+	struct flt_conf *config;           /* the filter's configuration */
+	void           *ctx;               /* The filter context (opaque) */
+	unsigned short  flags;             /* FLT_FL_* */
+	unsigned int    calls;             /* number of calls */
+	unsigned long long offset[2];      /* Offset of input data already filtered for a specific channel
+	                                    * 0: request channel, 1: response channel */
+	unsigned int    pre_analyzers;     /* bit field indicating analyzers to pre-process */
+	unsigned int    post_analyzers;    /* bit field indicating analyzers to post-process */
+	struct list     list;              /* Filter list for the stream */
+	/* Independent channel links; either may be unused for a instance. */
+	struct list     req_list;          /* Filter list for request channel */
+	struct list     res_list;          /* Filter list for response channel */
+};
+
+/*
+ * Structure reprensenting the "global" state of filters attached to a stream.
+ * Doesn't hold much information, as the channel themselves hold chn_flt struct
+ * which contains the per-channel members.
+ */
+struct strm_flt {
+	struct list    filters;               /* List of filters attached to a stream */
+	unsigned short flags;                 /* STRM_FL_* */
+};
+
+/* structure holding filter state for some members that are channel oriented */
+struct chn_flt {
+	struct list filters;                  /* List of filters attached to a channel */
+	struct filter *current;               /* From which filter resume processing, for a specific channel. */
+	unsigned char nb_data_filters;        /* Number of data filters registered on channel */
+	unsigned long long offset;
+};
+
+/**************************************************************/
+
+#define FLT_SIDE_REQ     0x01
+#define FLT_SIDE_RES     0x02
+#define FLT_SIDE_GLOBAL  0x04  /* Common order when no request/response side is selected */
+
+enum flt_pos {
+	FLT_POS_BEFORE,
+	FLT_POS_AFTER,
+};
+
+/* filter class flags */
+#define FLT_CLS_FL_MULTI  0x01   /* Set if several class instances are allowed per proxy */
+
+/* Anchor of a filter class in one of the three class orders. The classes moved
+ * before or after all the instances of this class are linked in the 'before'
+ * and 'after' constraint lists, while the class itself is linked in the order
+ * list once it was placed.
+ */
+struct filter_class_side {
+	struct list before;  /* classes moved before all instances of this class */
+	struct list after;   /* classes moved after all instances of this class */
+	struct list list;    /* link in the order list, once the class is placed */
+	unsigned int placed; /* != 0 once the class was explicitly placed */
+};
+
+struct filter_class {
+	const char *name;           /* The filter class name, must be unique */
+	unsigned int flags;         /* FLT_CLS_FL_* */
+
+	/* Callback to parse the arguments of a filter instance and produce
+	 * the filter configuration (inst->fconf).
+	 */
+	int (*parse)(char **args, struct proxy *px, struct filter_instance *inst, char **err);
+	struct filter_class_side global; /* placement in the global order */
+	struct filter_class_side req;    /* placement in the request order */
+	struct filter_class_side res;    /* placement in the response order */
+
+	struct list list; /* Link in the global registry of filter classes */
+};
+
+/* Per-proxy reference to a filter class, in the global, request or response
+ * order. It anchors the instances of this class in that order. References
+ * follow the corresponding class order, while instances of the same class
+ * keep their parsing order until filter-sequence directives are applied.
+ */
+struct filter_class_ref {
+	struct filter_class *class;   /* The referenced filter class */
+	struct list reordered_before; /* instances moved before all instances of this class, on this side */
+	struct list reordered_after;  /* instances moved after all instances of this class, on this side */
+	struct list instances;        /* instances of this class evaluated on this side (parsing order) */
+	struct list list;             /* Link in one of the proxy's class refs list */
+};
+
+/* filter instance flags */
+#define FLT_INST_F_IMPLICIT  0x01   /* The instance comes from an implicit declaration (e.g. use-fcgi-app) */
+#define FLT_INST_F_INHERITED 0x02   /* The instance was inherited from a defaults section */
+#define FLT_INST_F_SEXPLORE  0x04   /* The instance is on the current path of the sequence loop detection */
+
+/* Independent ordering links for one instance in one of the three orders. */
+struct filter_inst_side {
+	struct list reordered_before; /* instances moved before this instance */
+	struct list reordered_after;  /* instances moved after this instance */
+	struct list list;             /* link in the list holding this instance */
+};
+
+struct filter_instance {
+	const char *id;               /* The filter instance id, uniq for a class and a proxy */
+	unsigned int enabled;         /* != 0 if enabled */
+	unsigned int flags;           /* FLT_INST_F_* */
+	struct filter_class *class;   /* filter class for this instance */
+	struct proxy *px;             /* proxy owning this instance */
+	struct flt_conf *fconf;       /* filter configuration */
+	struct {
+		char *file;
+		int line;
+		int argc;
+		char **argv;
+	} conf;                       /* The raw configuration used during parsing */
+	struct filter_inst_side global; /* all instances, in global order */
+	struct filter_inst_side req;    /* instances on the request side */
+	struct filter_inst_side res;    /* instances on the response side */
+};
+
+struct filter_sequence {
+	const char *cls_name;     /* The class of the instance to move */
+	const char *id;           /* The id of the instance to move, NULL for the single instance of the class */
+	const char *cls_ref_name; /* The class of the reference entity (a class or a instance) */
+	const char *ref_id;       /* The id of the reference instance, NULL for the whole class */
+	unsigned int side;        /* FLT_SIDE_GLOBAL, FLT_SIDE_REQ or FLT_SIDE_RES */
+	enum flt_pos pos;         /* FLT_POS_BEFORE or FLT_POS_AFTER */
+	char *file;               /* The configuration file where the directive was found */
+	int line;                 /* The line in the configuration file */
+	struct list list;         /* Link in the list of filter sequences of a proxy, in configuration order */
+};
+
+struct filter_enabled {
+	const char *cls_name;   /* The class of the instances to enable/disable */
+	const char *id;         /* The id of the instance to enable/disable, NULL for all instances of the class */
+	unsigned int enable;    /* != 0 to enable the instances (filter-enable), 0 to disable them (filter-disable) */
+	char *file;             /* The configuration file where the directive was found */
+	int line;               /* The line in the configuration file */
+	struct list list;       /* Link in the list of filters to enable/disable for a proxy */
+};
+
+#endif /* _HAPROXY_FILTERS_T_H */
+
+/*
+ * Local variables:
+ *  c-indent-level: 8
+ *  c-basic-offset: 8
+ * End:
+ */
