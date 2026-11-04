@@ -595,6 +595,22 @@ static enum tcpcheck_eval_ret tcpcheck_mysql_expect_packet(struct check *check, 
 		goto error;
 	}
 
+	if (offset > 0 && *b_peek(&check->bi, offset+4) != '\x00') {
+		/* For the post-handshake authentication reply (offset > 0), only an OK
+		 * packet (header 0x00) indicates successful single-round-trip
+		 * authentication. An AuthSwitchRequest (0xfe) or AuthMoreData (0x01)
+		 * packet means the server expects additional authentication round trips
+		 * (e.g. plugin mismatch or non-empty password), which mysql-check
+		 * cannot complete because COM_QUIT is already pipelined.
+		 */
+		status = HCHK_STATUS_L7RSP;
+		if ((unsigned char)*b_peek(&check->bi, offset+4) == 0xfe)
+			desc = ist("MySQL server requested authentication method switch (0xfe); check mysql-check mode");
+		else
+			desc = ist("Unexpected MySQL authentication response packet (check user must have an empty password)");
+		goto error;
+	}
+
 	if (get_next_tcpcheck_rule(check->tcpcheck->rs, rule) != NULL) {
 		/* Not the last rule, continue */
 		goto out;
